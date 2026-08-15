@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.1.0
+// @version      1.1.1
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
@@ -16,7 +16,9 @@
 (() => {
   "use strict";
 
+  // ===========================================================================
   // Configuration
+  // ===========================================================================
 
   const INSTALL_KEY = Symbol.for(
     "wplace-template-tools.magenta-preview",
@@ -66,6 +68,9 @@
 
   const TOOLBAR_SELECTOR =
     '[data-wplace-clean-mode-overlay-toolbar="true"]';
+
+  const BACK_DIVIDER_SELECTOR =
+    "[data-wptt-back-divider]";
 
   const COLOR_STORAGE_KEY =
     "wplace-template-tools.preview-color";
@@ -194,14 +199,18 @@
     },
   ]);
 
+  // ===========================================================================
   // Duplicate-install protection
+  // ===========================================================================
 
   if (globalThis[INSTALL_KEY]) {
     globalThis[INSTALL_KEY].ensureUi?.();
     return;
   }
 
+  // ===========================================================================
   // State
+  // ===========================================================================
 
   const state = {
     color: loadSavedColor(),
@@ -252,7 +261,9 @@
   let pulseAnimationFrame = 0;
   let lastPulseFrameTime = 0;
 
+  // ===========================================================================
   // Settings
+  // ===========================================================================
 
   function loadSavedColor() {
     try {
@@ -307,7 +318,9 @@
     }
   }
 
+  // ===========================================================================
   // MapLibre capture
+  // ===========================================================================
 
   function looksLikeMapInstance(instance) {
     if (
@@ -556,7 +569,9 @@
 
   void getMapInstance();
 
+  // ===========================================================================
   // Shader patching
+  // ===========================================================================
 
   function isOverlayFragmentShader(source) {
     return (
@@ -663,45 +678,45 @@
       );
 
     /*
-     * Plus preview keeps one centered row and one centered column
-     * within each template pixel. At low zoom, matching coverage is
-     * approximated with alpha because the shape cannot be resolved.
+     * Plus preview keeps a centered cross inside each template pixel.
+     * The arms stop short of the pixel edges so neighboring crosses
+     * stay visually separate.
      */
-const withPlusPreview =
-  withPreviewOpacity.replace(
-    modeBranchNeedle,
-    [
-      `if (${PLUS_PREVIEW_UNIFORM_NAME}) {`,
-      `  float wptt_arm_inset = 0.125;`,
-      `  float wptt_half_thickness = 0.125;`,
-      `  float wptt_arm_length = 1.0 - 2.0 * wptt_arm_inset;`,
-      `  float wptt_bar_thickness = 2.0 * wptt_half_thickness;`,
-      `  float wptt_coverage =`,
-      `    2.0 * wptt_bar_thickness * wptt_arm_length -`,
-      `    wptt_bar_thickness * wptt_bar_thickness;`,
-      ``,
-      `  if (!pixel_mode_detail_supported || pixels_per_source < 3.0) {`,
-      `    color.a *= wptt_coverage;`,
-      `  } else {`,
-      `    vec2 wptt_local = fract(source_coordinate + vec2(0.00001));`,
-      ``,
-      `    bool wptt_vertical =`,
-      `      abs(wptt_local.x - 0.5) <= wptt_half_thickness &&`,
-      `      wptt_local.y >= wptt_arm_inset &&`,
-      `      wptt_local.y <= 1.0 - wptt_arm_inset;`,
-      ``,
-      `    bool wptt_horizontal =`,
-      `      abs(wptt_local.y - 0.5) <= wptt_half_thickness &&`,
-      `      wptt_local.x >= wptt_arm_inset &&`,
-      `      wptt_local.x <= 1.0 - wptt_arm_inset;`,
-      ``,
-      `    if (!wptt_vertical && !wptt_horizontal) {`,
-      `      discard;`,
-      `    }`,
-      `  }`,
-      `} else if (mode != 0) {`,
-    ].join("\n"),
-  );
+    const withPlusPreview =
+      withPreviewOpacity.replace(
+        modeBranchNeedle,
+        [
+          `if (${PLUS_PREVIEW_UNIFORM_NAME}) {`,
+          `  float wptt_arm_inset = 0.125;`,
+          `  float wptt_half_thickness = 0.125;`,
+          `  float wptt_arm_length = 1.0 - 2.0 * wptt_arm_inset;`,
+          `  float wptt_bar_thickness = 2.0 * wptt_half_thickness;`,
+          `  float wptt_coverage =`,
+          `    2.0 * wptt_bar_thickness * wptt_arm_length -`,
+          `    wptt_bar_thickness * wptt_bar_thickness;`,
+          ``,
+          `  if (!pixel_mode_detail_supported || pixels_per_source < 3.0) {`,
+          `    color.a *= wptt_coverage;`,
+          `  } else {`,
+          `    vec2 wptt_local = fract(source_coordinate + vec2(0.00001));`,
+          ``,
+          `    bool wptt_vertical =`,
+          `      abs(wptt_local.x - 0.5) <= wptt_half_thickness &&`,
+          `      wptt_local.y >= wptt_arm_inset &&`,
+          `      wptt_local.y <= 1.0 - wptt_arm_inset;`,
+          ``,
+          `    bool wptt_horizontal =`,
+          `      abs(wptt_local.y - 0.5) <= wptt_half_thickness &&`,
+          `      wptt_local.x >= wptt_arm_inset &&`,
+          `      wptt_local.x <= 1.0 - wptt_arm_inset;`,
+          ``,
+          `    if (!wptt_vertical && !wptt_horizontal) {`,
+          `      discard;`,
+          `    }`,
+          `  }`,
+          `} else if (mode != 0) {`,
+        ].join("\n"),
+      );
 
     return withPlusPreview.replace(
       colorNeedle,
@@ -721,7 +736,9 @@ const withPlusPreview =
     );
   }
 
+  // ===========================================================================
   // Overlay program tracking
+  // ===========================================================================
 
   function trackOverlayProgram(
     gl,
@@ -1055,7 +1072,9 @@ const withPlusPreview =
     record.maskCache.clear();
   }
 
+  // ===========================================================================
   // Current template draw
+  // ===========================================================================
 
   function getTextureId(texture) {
     let id =
@@ -1340,7 +1359,9 @@ const withPlusPreview =
     }
   }
 
+  // ===========================================================================
   // Template texture readback
+  // ===========================================================================
 
   function readTemplatePixels(
     record,
@@ -1461,7 +1482,9 @@ const withPlusPreview =
     }
   }
 
+  // ===========================================================================
   // Template coordinates
+  // ===========================================================================
 
   function lerp(a, b, t) {
     return (
@@ -1720,7 +1743,9 @@ const withPlusPreview =
     };
   }
 
+  // ===========================================================================
   // Geographic coordinate -> artwork tile
+  // ===========================================================================
 
   function longitudeToTileX(
     longitude,
@@ -1835,7 +1860,9 @@ const withPlusPreview =
     );
   }
 
+  // ===========================================================================
   // Geographic lookup cache
+  // ===========================================================================
 
   async function buildLookupData(
     record,
@@ -1940,7 +1967,9 @@ const withPlusPreview =
     };
   }
 
+  // ===========================================================================
   // Artwork PNG loading
+  // ===========================================================================
 
   async function loadArtworkTile(
     tileX,
@@ -2115,7 +2144,9 @@ const withPlusPreview =
     }
   }
 
+  // ===========================================================================
   // Mismatch comparison
+  // ===========================================================================
 
   async function buildMismatchMask(
     record,
@@ -2363,7 +2394,9 @@ const withPlusPreview =
     );
   }
 
+  // ===========================================================================
   // Mask texture
+  // ===========================================================================
 
   function uploadMaskTexture(
     record,
@@ -2467,7 +2500,9 @@ const withPlusPreview =
     }
   }
 
+  // ===========================================================================
   // Comparison cache
+  // ===========================================================================
 
   function getMaskEntry(
     record,
@@ -2669,7 +2704,9 @@ const withPlusPreview =
     );
   }
 
+  // ===========================================================================
   // Bind comparison mask
+  // ===========================================================================
 
   function bindComparisonForDraw(
     record,
@@ -2765,7 +2802,9 @@ const withPlusPreview =
     };
   }
 
+  // ===========================================================================
   // Draw interception
+  // ===========================================================================
 
   function drawWithComparison(
     gl,
@@ -2838,7 +2877,9 @@ const withPlusPreview =
     return result;
   }
 
+  // ===========================================================================
   // WebGL hooks
+  // ===========================================================================
 
   function patchContextPrototype(
     prototype,
@@ -3074,7 +3115,9 @@ const withPlusPreview =
       ?.prototype,
   );
 
+  // ===========================================================================
   // Pulse animation
+  // ===========================================================================
 
   function setPulseBrightness(
     brightness,
@@ -3201,7 +3244,9 @@ const withPlusPreview =
     }
   }
 
+  // ===========================================================================
   // Refresh handling
+  // ===========================================================================
 
   function refreshComparison() {
     artworkGeneration += 1;
@@ -3321,7 +3366,9 @@ const withPlusPreview =
     COMPARISON_REFRESH_MS,
   );
 
+  // ===========================================================================
   // Highlight state
+  // ===========================================================================
 
   function getNextHighlightMode() {
     if (
@@ -3571,7 +3618,9 @@ const withPlusPreview =
     );
   }
 
+  // ===========================================================================
   // Toolbar buttons
+  // ===========================================================================
 
   function getNativeModeButtons(
     toolbar,
@@ -4295,6 +4344,25 @@ const withPlusPreview =
             var(--color-base-100, #ffffff) !important;
         }
       }
+
+      [data-wptt-back-button] {
+        width: 2rem !important;
+        min-width: 2rem !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+        gap: 0 !important;
+        justify-content: center !important;
+      }
+
+      [data-wptt-back-divider] {
+        width: 1px;
+        height: 1.25rem;
+        flex: 0 0 1px;
+        margin: 0 0.25rem;
+        background-color: currentColor;
+        opacity: 0.2;
+        pointer-events: none;
+      }
     `;
 
     (
@@ -4303,7 +4371,9 @@ const withPlusPreview =
     ).append(style);
   }
 
+  // ===========================================================================
   // Modal settings
+  // ===========================================================================
 
   function updateSettingsUi() {
     document
@@ -4376,7 +4446,9 @@ const withPlusPreview =
     panel.className =
       "mx-4 mt-3 rounded-xl bg-base-200/60 px-3 py-2.5";
 
+    // -------------------------------------------------------------------------
     // Color row
+    // -------------------------------------------------------------------------
 
     const colorRow =
       document.createElement(
@@ -4523,7 +4595,9 @@ const withPlusPreview =
       colorControls,
     );
 
+    // -------------------------------------------------------------------------
     // Divider
+    // -------------------------------------------------------------------------
 
     const divider =
       document.createElement(
@@ -4533,7 +4607,9 @@ const withPlusPreview =
     divider.className =
       "border-base-content/10 my-2.5 border-t";
 
+    // -------------------------------------------------------------------------
     // Pulse preference
+    // -------------------------------------------------------------------------
 
     const pulseRow =
       document.createElement(
@@ -4662,7 +4738,9 @@ const withPlusPreview =
     return panel;
   }
 
+  // ===========================================================================
   // Wplace UI discovery
+  // ===========================================================================
 
   function findOverlayToolbar() {
     const markedToolbar =
@@ -4719,6 +4797,108 @@ const withPlusPreview =
     return null;
   }
 
+  function ensureBackButtonPresentation(
+    toolbar,
+  ) {
+    if (!toolbar) {
+      return;
+    }
+
+    const backButton =
+      toolbar.querySelector(
+        ":scope > button.btn-sm.shrink-0:not(.btn-square)",
+      );
+
+    if (!backButton) {
+      return;
+    }
+
+    if (
+      !backButton.hasAttribute(
+        "data-wptt-back-button",
+      )
+    ) {
+      backButton.dataset
+        .wpttBackButton = "";
+
+      backButton.title = "Back";
+
+      backButton.setAttribute(
+        "aria-label",
+        "Back",
+      );
+    }
+
+    /*
+     * Preserve the existing icon while removing visible label text.
+     * The button's native classes stay intact so toolbar discovery
+     * continues to recognize it as Wplace's Back control.
+     */
+    const textNodes = [];
+
+    const walker =
+      document.createTreeWalker(
+        backButton,
+        NodeFilter.SHOW_TEXT,
+      );
+
+    while (walker.nextNode()) {
+      const textNode =
+        walker.currentNode;
+
+      if (
+        textNode.textContent.trim() &&
+        !textNode.parentElement?.closest(
+          "svg",
+        )
+      ) {
+        textNodes.push(
+          textNode,
+        );
+      }
+    }
+
+    for (
+      const textNode of
+      textNodes
+    ) {
+      textNode.remove();
+    }
+
+    let divider =
+      toolbar.querySelector(
+        BACK_DIVIDER_SELECTOR,
+      );
+
+    if (!divider) {
+      divider =
+        document.createElement(
+          "div",
+        );
+
+      divider.dataset
+        .wpttBackDivider = "";
+
+      divider.setAttribute(
+        "aria-hidden",
+        "true",
+      );
+    }
+
+    /*
+     * Keep the divider directly after Back without moving it again
+     * when it is already in the correct position.
+     */
+    if (
+      backButton.nextElementSibling !==
+      divider
+    ) {
+      backButton.after(
+        divider,
+      );
+    }
+  }
+
   function ensureToolbarButtons() {
     const toolbar =
       findOverlayToolbar();
@@ -4726,6 +4906,10 @@ const withPlusPreview =
     if (!toolbar) {
       return;
     }
+
+    ensureBackButtonPresentation(
+      toolbar,
+    );
 
     /*
      * Capture and replace Wplace's original Full Pixel icon before
@@ -4799,27 +4983,27 @@ const withPlusPreview =
         nativeButtons.length - 1
       ] ?? null;
 
-if (lastNativeButton) {
-  if (
-    plusPreviewButton
-      .previousElementSibling !==
-    lastNativeButton
-  ) {
-    lastNativeButton.after(
-      plusPreviewButton,
-    );
-  }
+    if (lastNativeButton) {
+      if (
+        plusPreviewButton
+          .previousElementSibling !==
+        lastNativeButton
+      ) {
+        lastNativeButton.after(
+          plusPreviewButton,
+        );
+      }
 
-  if (
-    fullPreviewButton
-      .previousElementSibling !==
-    plusPreviewButton
-  ) {
-    plusPreviewButton.after(
-      fullPreviewButton,
-    );
-  }
-} else {
+      if (
+        fullPreviewButton
+          .previousElementSibling !==
+        plusPreviewButton
+      ) {
+        plusPreviewButton.after(
+          fullPreviewButton,
+        );
+      }
+    } else {
       const backButton =
         toolbar.querySelector(
           ":scope > button.btn-sm.shrink-0:not(.btn-square)",
@@ -4907,7 +5091,9 @@ if (lastNativeButton) {
   state.ensureUi =
     ensureUi;
 
+  // ===========================================================================
   // DOM observer
+  // ===========================================================================
 
   let ensureScheduled = false;
 
@@ -4936,7 +5122,9 @@ if (lastNativeButton) {
 
   ensureUi();
 
+  // ===========================================================================
   // Public API
+  // ===========================================================================
 
   globalThis.wplaceTemplateTools = {
     refresh:
@@ -4967,7 +5155,7 @@ if (lastNativeButton) {
       }
 
       return {
-        version: "1.2.0",
+        version: "1.1.1",
 
         highlight:
           state.highlightMode ===
