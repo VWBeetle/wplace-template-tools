@@ -2,9 +2,13 @@
 
 A Tampermonkey userscript that adds extra controls to the template overlay toolbar on [wplace.live](https://wplace.live/).
 
-## Preview visibility toggle
+Right now it only adds one new tool, but I plan to add others.
 
-When an overlay is open, a lightning-bolt button appears between **Back** and Wplace's existing pixel display options. Turn it on to render every currently visible preview pixel in a high-visibility color. Turn it off to restore the overlay's original colors.
+## Highlight Toggle
+
+When an overlay is open, a lightning-bolt button appears on the template toolbar. Turn it on to render every currently visible preview pixel in a high-visibility color. Press it again to make the color pulse.
+
+Note that you can still freely change the shape of your preview pixels or sort them by color. Only the pixels that aren't yet correct will be highlighted.
 
 Choose the visibility color from the **Preview visibility color** setting at the top of Wplace's Overlays modal. The selected preset is saved across reloads. Available colors are:
 
@@ -14,22 +18,13 @@ Choose the visibility color from the **Preview visibility color** setting at the
 - Neon orange (`#ff5f1f`)
 - Neon cyan (`#00ffff`)
 
-The toggle changes only the local preview. It does not edit the overlay image or place pixels.
+The toggle changes only the preview. It does not edit the overlay image or place pixels. It's just to help find those sneaky ones you keep missing.
 
 ## Install
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
-2. Open [`wplace-template-tools.user.js`](./wplace-template-tools.user.js) and copy it into a new Tampermonkey script.
-3. Save the script and reload `https://wplace.live/`.
+2. Open [this link](https://raw.githubusercontent.com/VWBeetle/wplace-template-tools/main/wplace-template-tools.user.js) and Tampermonkey should prompt you to install the script
+3. Reload wplace.live
 
-Once this file is available on the repository's `main` branch, Tampermonkey can also install it from the [raw userscript URL](https://raw.githubusercontent.com/VWBeetle/wplace-template-tools/main/wplace-template-tools.user.js).
-
-## Development
-
-Run the dependency-free test suite with:
-
-```sh
-node --test
-```
-
-The userscript runs at `document-start` because it adds a small, reversible uniform to Wplace's overlay shader as that shader is compiled. It does not automate painting, change cooldowns, or make network requests.
+## License
+MIT License

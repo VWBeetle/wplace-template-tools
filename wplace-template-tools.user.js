@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.0.0
+// @version      1.0.1
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
@@ -3365,11 +3365,6 @@
           state.highlightMode ===
           HIGHLIGHT_PULSE;
 
-        /*
-         * Solid uses Wplace's normal active appearance.
-         *
-         * Pulse uses our deliberately inverted appearance instead.
-         */
         button.classList.toggle(
           "btn-active",
           solid,
@@ -3653,7 +3648,7 @@
       "text-base-content/50 text-xs";
 
     colorDescription.textContent =
-      "Used for template pixels that still need work";
+      "Used to highlight template pixels that still need work";
 
     colorCopy.append(
       colorTitle,
@@ -3832,7 +3827,7 @@
       "text-base-content/50 text-xs";
 
     pulseDescription.textContent =
-      "Adds Pulse to the highlight button cycle";
+      "Clicking highlight button a second time makes highlight color pulse";
 
     pulseCopy.append(
       pulseTitle,
