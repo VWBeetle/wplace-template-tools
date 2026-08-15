@@ -7,10 +7,10 @@ A Tampermonkey userscript that adds extra controls to the template overlay toolb
 * Configurable pulse mode for highlight, making it even more noticeable
 * Swappable highlight color in template modal
 * New +-shaped preview pixels for your overlays
-* Finished image preview so you can see what it will look like when complete
-* Gives 'full pixel' transparency mode a new icon to better represent what it does and gives the old icon to the new "finished image preview" option
+* Transparent overlay option can now be clicked a second time to toggle it to opaque so you can see a preview of your finished image
+* Back button label is removed from toolbar because the icon is self-explanatory
 
-## Highlight Toggle
+### Highlight Toggle
 
 When an overlay is open, a lightning-bolt button appears on the template toolbar. Turn it on to render every currently visible preview pixel in a high-visibility color. Press it again to make the color pulse.
 
@@ -25,6 +25,10 @@ Choose the visibility color from the **Preview visibility color** setting at the
 - Neon cyan (`#00ffff`)
 
 The toggle changes only the preview. It does not edit the overlay image or place pixels. It's just to help find those sneaky ones you keep missing.
+
+### Transparency/Finished Image Preview Toggle
+
+You'll notice the button to make your overlay semi-transparent has a new icon to better reflect what it does. Clicking it a second time will now toggle to a solid version so you can preview what your finished image will look like. This will also switch the icon to the old, solid-filled one so you can tell which mode it's in.
 
 ## Install
 
