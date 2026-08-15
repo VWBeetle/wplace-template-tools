@@ -8,6 +8,8 @@ Right now it only adds one new tool, but I plan to add others.
 
 When an overlay is open, a lightning-bolt button appears on the template toolbar. Turn it on to render every currently visible preview pixel in a high-visibility color. Press it again to make the color pulse.
 
+Note that you can still freely change the shape of your preview pixels or sort them by color. Only the pixels that aren't yet correct will be highlighted.
+
 Choose the visibility color from the **Preview visibility color** setting at the top of Wplace's Overlays modal. The selected preset is saved across reloads. Available colors are:
 
 - Magenta (`#ff00ff`)
