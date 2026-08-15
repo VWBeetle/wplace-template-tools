@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.0.1
+// @version      1.1.0
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
@@ -16,9 +16,7 @@
 (() => {
   "use strict";
 
-  // ===========================================================================
   // Configuration
-  // ===========================================================================
 
   const INSTALL_KEY = Symbol.for(
     "wplace-template-tools.magenta-preview",
@@ -39,14 +37,23 @@
   const PULSE_BRIGHTNESS_UNIFORM_NAME =
     "u_wptt_pulse_brightness";
 
+  const FULL_PREVIEW_UNIFORM_NAME =
+    "u_wptt_full_preview_enabled";
+
+  const PLUS_PREVIEW_UNIFORM_NAME =
+    "u_wptt_plus_preview_enabled";
+
   const BUTTON_SELECTOR =
     "[data-wptt-magenta-toggle]";
 
+  const FULL_PREVIEW_BUTTON_SELECTOR =
+    "[data-wptt-full-preview-toggle]";
+
+  const PLUS_PREVIEW_BUTTON_SELECTOR =
+    "[data-wptt-plus-preview-toggle]";
+
   const COLOR_BUTTON_SELECTOR =
     "[data-wptt-preview-color]";
-
-  const COLOR_NAME_SELECTOR =
-    "[data-wptt-color-name]";
 
   const SETTINGS_SELECTOR =
     "[data-wptt-settings]";
@@ -98,6 +105,62 @@
   const HIGHLIGHT_SOLID = 1;
   const HIGHLIGHT_PULSE = 2;
 
+  const FALLBACK_FULL_PIXEL_ICON_MARKUP = `
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      class="size-3.5"
+      aria-hidden="true"
+    >
+      <rect x="4" y="4" width="16" height="16" rx="1"></rect>
+    </svg>
+  `;
+
+  const CHECKERBOARD_ICON_MARKUP = `
+<svg
+  data-wptt-checkerboard-svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 24 24"
+  class="size-3.5"
+  aria-hidden="true"
+>
+  <rect
+    x="3"
+    y="3"
+    width="18"
+    height="18"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+  ></rect>
+
+  <path
+    d="M3 3h9v9H3V3Zm9 9h9v9h-9v-9Z"
+    fill="currentColor"
+  ></path>
+
+  <path
+    d="M12 3v18M3 12h18"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+  ></path>
+</svg>
+  `;
+
+  const PLUS_PREVIEW_ICON_MARKUP = `
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      class="size-3.5"
+      aria-hidden="true"
+    >
+      <path d="M9 3h6v6h6v6h-6v6H9v-6H3V9h6V3Z"></path>
+    </svg>
+  `;
+
   const COLOR_PRESETS = Object.freeze([
     {
       id: "magenta",
@@ -131,24 +194,29 @@
     },
   ]);
 
-  // ===========================================================================
   // Duplicate-install protection
-  // ===========================================================================
 
   if (globalThis[INSTALL_KEY]) {
     globalThis[INSTALL_KEY].ensureUi?.();
     return;
   }
 
-  // ===========================================================================
   // State
-  // ===========================================================================
 
   const state = {
     color: loadSavedColor(),
     pulseEnabled: loadPulseEnabled(),
 
     highlightMode: HIGHLIGHT_OFF,
+    fullPreviewEnabled: false,
+    plusPreviewEnabled: false,
+
+    /*
+     * Added preview buttons behave like extra display modes.
+     * Remember the native mode so it can be visually restored afterward.
+     */
+    nativeModeSelectionIndex: null,
+    fullPixelIconMarkup: null,
 
     pulseBrightness: 1,
 
@@ -172,6 +240,9 @@
   const artworkTileCache =
     new Map();
 
+  const nativeModeButtonsBound =
+    new WeakSet();
+
   let nextTextureId = 1;
 
   let artworkGeneration = 0;
@@ -181,9 +252,7 @@
   let pulseAnimationFrame = 0;
   let lastPulseFrameTime = 0;
 
-  // ===========================================================================
   // Settings
-  // ===========================================================================
 
   function loadSavedColor() {
     try {
@@ -238,9 +307,7 @@
     }
   }
 
-  // ===========================================================================
   // MapLibre capture
-  // ===========================================================================
 
   function looksLikeMapInstance(instance) {
     if (
@@ -489,9 +556,7 @@
 
   void getMapInstance();
 
-  // ===========================================================================
   // Shader patching
-  // ===========================================================================
 
   function isOverlayFragmentShader(source) {
     return (
@@ -526,12 +591,30 @@
     const samplerNeedle =
       "uniform sampler2D u_texture;";
 
+    const modeNeedle =
+      "int mode = u_mode;";
+
+    const opacityNeedle =
+      "color.a *= u_opacity;";
+
+    const modeBranchNeedle =
+      "if (mode != 0) {";
+
     const colorNeedle =
       "color.rgb *= color.a;";
 
     if (
       !source.includes(
         samplerNeedle,
+      ) ||
+      !source.includes(
+        modeNeedle,
+      ) ||
+      !source.includes(
+        opacityNeedle,
+      ) ||
+      !source.includes(
+        modeBranchNeedle,
       ) ||
       !source.includes(
         colorNeedle,
@@ -554,10 +637,73 @@
           `uniform sampler2D ${MASK_UNIFORM_NAME};`,
           `uniform bool ${MASK_READY_UNIFORM_NAME};`,
           `uniform float ${PULSE_BRIGHTNESS_UNIFORM_NAME};`,
+          `uniform bool ${FULL_PREVIEW_UNIFORM_NAME};`,
+          `uniform bool ${PLUS_PREVIEW_UNIFORM_NAME};`,
         ].join("\n"),
       );
 
-    return withUniforms.replace(
+    /*
+     * Finished preview removes the center/diagonal pixel pattern.
+     */
+    const withPreviewMode =
+      withUniforms.replace(
+        modeNeedle,
+        `int mode = ${FULL_PREVIEW_UNIFORM_NAME} ? 0 : u_mode;`,
+      );
+
+    /*
+     * Wplace's transparent display mode also lowers u_opacity.
+     * Finished preview must override that separately so switching
+     * from the transparent mode still produces an opaque image.
+     */
+    const withPreviewOpacity =
+      withPreviewMode.replace(
+        opacityNeedle,
+        `color.a *= ((${FULL_PREVIEW_UNIFORM_NAME} || ${PLUS_PREVIEW_UNIFORM_NAME}) ? 1.0 : u_opacity);`,
+      );
+
+    /*
+     * Plus preview keeps one centered row and one centered column
+     * within each template pixel. At low zoom, matching coverage is
+     * approximated with alpha because the shape cannot be resolved.
+     */
+const withPlusPreview =
+  withPreviewOpacity.replace(
+    modeBranchNeedle,
+    [
+      `if (${PLUS_PREVIEW_UNIFORM_NAME}) {`,
+      `  float wptt_arm_inset = 0.125;`,
+      `  float wptt_half_thickness = 0.125;`,
+      `  float wptt_arm_length = 1.0 - 2.0 * wptt_arm_inset;`,
+      `  float wptt_bar_thickness = 2.0 * wptt_half_thickness;`,
+      `  float wptt_coverage =`,
+      `    2.0 * wptt_bar_thickness * wptt_arm_length -`,
+      `    wptt_bar_thickness * wptt_bar_thickness;`,
+      ``,
+      `  if (!pixel_mode_detail_supported || pixels_per_source < 3.0) {`,
+      `    color.a *= wptt_coverage;`,
+      `  } else {`,
+      `    vec2 wptt_local = fract(source_coordinate + vec2(0.00001));`,
+      ``,
+      `    bool wptt_vertical =`,
+      `      abs(wptt_local.x - 0.5) <= wptt_half_thickness &&`,
+      `      wptt_local.y >= wptt_arm_inset &&`,
+      `      wptt_local.y <= 1.0 - wptt_arm_inset;`,
+      ``,
+      `    bool wptt_horizontal =`,
+      `      abs(wptt_local.y - 0.5) <= wptt_half_thickness &&`,
+      `      wptt_local.x >= wptt_arm_inset &&`,
+      `      wptt_local.x <= 1.0 - wptt_arm_inset;`,
+      ``,
+      `    if (!wptt_vertical && !wptt_horizontal) {`,
+      `      discard;`,
+      `    }`,
+      `  }`,
+      `} else if (mode != 0) {`,
+    ].join("\n"),
+  );
+
+    return withPlusPreview.replace(
       colorNeedle,
       [
         `if (${ENABLED_UNIFORM_NAME} && ${MASK_READY_UNIFORM_NAME}) {`,
@@ -575,9 +721,7 @@
     );
   }
 
-  // ===========================================================================
   // Overlay program tracking
-  // ===========================================================================
 
   function trackOverlayProgram(
     gl,
@@ -643,6 +787,20 @@
           PULSE_BRIGHTNESS_UNIFORM_NAME,
         ),
 
+      fullPreview:
+        native.getUniformLocation.call(
+          gl,
+          program,
+          FULL_PREVIEW_UNIFORM_NAME,
+        ),
+
+      plusPreview:
+        native.getUniformLocation.call(
+          gl,
+          program,
+          PLUS_PREVIEW_UNIFORM_NAME,
+        ),
+
       texture:
         native.getUniformLocation.call(
           gl,
@@ -706,6 +864,8 @@
       locations.mask === null ||
       locations.maskReady === null ||
       locations.pulseBrightness === null ||
+      locations.fullPreview === null ||
+      locations.plusPreview === null ||
       locations.matrix === null ||
       locations.worldSize === null
     ) {
@@ -801,6 +961,18 @@
         state.pulseBrightness,
       );
 
+      native.uniform1i.call(
+        gl,
+        locations.fullPreview,
+        state.fullPreviewEnabled ? 1 : 0,
+      );
+
+      native.uniform1i.call(
+        gl,
+        locations.plusPreview,
+        state.plusPreviewEnabled ? 1 : 0,
+      );
+
       native.useProgram.call(
         gl,
         previousProgram,
@@ -883,9 +1055,7 @@
     record.maskCache.clear();
   }
 
-  // ===========================================================================
   // Current template draw
-  // ===========================================================================
 
   function getTextureId(texture) {
     let id =
@@ -1170,9 +1340,7 @@
     }
   }
 
-  // ===========================================================================
   // Template texture readback
-  // ===========================================================================
 
   function readTemplatePixels(
     record,
@@ -1293,9 +1461,7 @@
     }
   }
 
-  // ===========================================================================
   // Template coordinates
-  // ===========================================================================
 
   function lerp(a, b, t) {
     return (
@@ -1554,9 +1720,7 @@
     };
   }
 
-  // ===========================================================================
   // Geographic coordinate -> artwork tile
-  // ===========================================================================
 
   function longitudeToTileX(
     longitude,
@@ -1671,9 +1835,7 @@
     );
   }
 
-  // ===========================================================================
   // Geographic lookup cache
-  // ===========================================================================
 
   async function buildLookupData(
     record,
@@ -1778,9 +1940,7 @@
     };
   }
 
-  // ===========================================================================
   // Artwork PNG loading
-  // ===========================================================================
 
   async function loadArtworkTile(
     tileX,
@@ -1955,9 +2115,7 @@
     }
   }
 
-  // ===========================================================================
   // Mismatch comparison
-  // ===========================================================================
 
   async function buildMismatchMask(
     record,
@@ -2205,9 +2363,7 @@
     );
   }
 
-  // ===========================================================================
   // Mask texture
-  // ===========================================================================
 
   function uploadMaskTexture(
     record,
@@ -2311,9 +2467,7 @@
     }
   }
 
-  // ===========================================================================
   // Comparison cache
-  // ===========================================================================
 
   function getMaskEntry(
     record,
@@ -2515,9 +2669,7 @@
     );
   }
 
-  // ===========================================================================
   // Bind comparison mask
-  // ===========================================================================
 
   function bindComparisonForDraw(
     record,
@@ -2613,9 +2765,7 @@
     };
   }
 
-  // ===========================================================================
   // Draw interception
-  // ===========================================================================
 
   function drawWithComparison(
     gl,
@@ -2688,9 +2838,7 @@
     return result;
   }
 
-  // ===========================================================================
   // WebGL hooks
-  // ===========================================================================
 
   function patchContextPrototype(
     prototype,
@@ -2926,9 +3074,7 @@
       ?.prototype,
   );
 
-  // ===========================================================================
   // Pulse animation
-  // ===========================================================================
 
   function setPulseBrightness(
     brightness,
@@ -3055,9 +3201,7 @@
     }
   }
 
-  // ===========================================================================
   // Refresh handling
-  // ===========================================================================
 
   function refreshComparison() {
     artworkGeneration += 1;
@@ -3177,9 +3321,7 @@
     COMPARISON_REFRESH_MS,
   );
 
-  // ===========================================================================
   // Highlight state
-  // ===========================================================================
 
   function getNextHighlightMode() {
     if (
@@ -3307,6 +3449,108 @@
     requestMapRepaint();
   }
 
+  function isCustomPreviewEnabled() {
+    return (
+      state.fullPreviewEnabled ||
+      state.plusPreviewEnabled
+    );
+  }
+
+  function setCustomPreviewMode(
+    mode,
+    {
+      restoreNativeSelection = true,
+    } = {},
+  ) {
+    const nextFull =
+      mode === "full";
+
+    const nextPlus =
+      mode === "plus";
+
+    const wasCustom =
+      isCustomPreviewEnabled();
+
+    const willBeCustom =
+      nextFull || nextPlus;
+
+    if (
+      state.fullPreviewEnabled ===
+        nextFull &&
+      state.plusPreviewEnabled ===
+        nextPlus
+    ) {
+      return;
+    }
+
+    const toolbar =
+      findOverlayToolbar();
+
+    if (
+      !wasCustom &&
+      willBeCustom &&
+      toolbar
+    ) {
+      rememberNativeModeSelection(
+        toolbar,
+      );
+    }
+
+    state.fullPreviewEnabled =
+      nextFull;
+
+    state.plusPreviewEnabled =
+      nextPlus;
+
+    if (
+      wasCustom &&
+      !willBeCustom &&
+      !restoreNativeSelection
+    ) {
+      state.nativeModeSelectionIndex =
+        null;
+    }
+
+    state.records.forEach(
+      setProgramUniforms,
+    );
+
+    updateButtons();
+
+    if (
+      toolbar &&
+      wasCustom &&
+      !willBeCustom &&
+      restoreNativeSelection
+    ) {
+      restoreNativeModeSelection(
+        toolbar,
+      );
+    }
+
+    requestMapRepaint();
+  }
+
+  function setFullPreviewEnabled(
+    enabled,
+    options = {},
+  ) {
+    setCustomPreviewMode(
+      enabled ? "full" : null,
+      options,
+    );
+  }
+
+  function setPlusPreviewEnabled(
+    enabled,
+    options = {},
+  ) {
+    setCustomPreviewMode(
+      enabled ? "plus" : null,
+      options,
+    );
+  }
+
   function requestMapRepaint() {
     if (
       state.map &&
@@ -3327,9 +3571,367 @@
     );
   }
 
-  // ===========================================================================
-  // Toolbar button
-  // ===========================================================================
+  // Toolbar buttons
+
+  function getNativeModeButtons(
+    toolbar,
+  ) {
+    if (!toolbar) {
+      return [];
+    }
+
+    return [
+      ...toolbar.querySelectorAll(
+        ":scope > button.btn-xs.btn-square",
+      ),
+    ].filter(
+      (button) =>
+        !button.matches(
+          BUTTON_SELECTOR,
+        ) &&
+        !button.matches(
+          FULL_PREVIEW_BUTTON_SELECTOR,
+        ) &&
+        !button.matches(
+          PLUS_PREVIEW_BUTTON_SELECTOR,
+        ),
+    );
+  }
+
+  function getButtonHint(button) {
+    return [
+      button.title,
+      button.getAttribute(
+        "aria-label",
+      ),
+      button.getAttribute(
+        "data-tip",
+      ),
+      button.getAttribute(
+        "data-tooltip",
+      ),
+      button.textContent,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function findNativeFullPixelButton(
+    toolbar,
+  ) {
+    const nativeButtons =
+      getNativeModeButtons(
+        toolbar,
+      );
+
+    const namedButton =
+      nativeButtons.find(
+        (button) =>
+          /full\s*pixel/.test(
+            getButtonHint(
+              button,
+            ),
+          ),
+      );
+
+    if (namedButton) {
+      return namedButton;
+    }
+
+    /*
+     * Wplace currently orders the native mode controls as
+     * Center Dots, Full Pixel, Half Diagonal.
+     */
+    return nativeButtons.length >= 3
+      ? nativeButtons[1]
+      : null;
+  }
+
+  function replaceButtonSvg(
+    button,
+    markup,
+  ) {
+    const container =
+      document.createElement(
+        "div",
+      );
+
+    container.innerHTML =
+      markup.trim();
+
+    const replacement =
+      container.firstElementChild;
+
+    if (!replacement) {
+      return;
+    }
+
+    const existingSvg =
+      button.querySelector(
+        "svg",
+      );
+
+    if (existingSvg) {
+      existingSvg.replaceWith(
+        replacement,
+      );
+    } else {
+      button.prepend(
+        replacement,
+      );
+    }
+  }
+
+  function prepareNativeModeIcons(
+    toolbar,
+  ) {
+    const fullPixelButton =
+      findNativeFullPixelButton(
+        toolbar,
+      );
+
+    if (!fullPixelButton) {
+      return;
+    }
+
+    const currentSvg =
+      fullPixelButton.querySelector(
+        "svg",
+      );
+
+    if (
+      !state.fullPixelIconMarkup &&
+      currentSvg &&
+      !currentSvg.matches(
+        "[data-wptt-checkerboard-svg]",
+      )
+    ) {
+      state.fullPixelIconMarkup =
+        currentSvg.outerHTML;
+    }
+
+    if (
+      !fullPixelButton.querySelector(
+        "[data-wptt-checkerboard-svg]",
+      )
+    ) {
+      replaceButtonSvg(
+        fullPixelButton,
+        CHECKERBOARD_ICON_MARKUP,
+      );
+    }
+
+    const previewButton =
+      toolbar.querySelector(
+        FULL_PREVIEW_BUTTON_SELECTOR,
+      );
+
+    if (
+      previewButton &&
+      state.fullPixelIconMarkup &&
+      !previewButton.dataset
+        .wpttFullPixelIconApplied
+    ) {
+      previewButton.innerHTML =
+        state.fullPixelIconMarkup;
+
+      previewButton.dataset
+        .wpttFullPixelIconApplied =
+        "true";
+    }
+  }
+
+  function isNativeModeSelected(
+    button,
+  ) {
+    return (
+      button.classList.contains(
+        "btn-active",
+      ) ||
+      button.getAttribute(
+        "aria-pressed",
+      ) === "true" ||
+      button.getAttribute(
+        "aria-checked",
+      ) === "true"
+    );
+  }
+
+  function rememberNativeModeSelection(
+    toolbar,
+  ) {
+    const nativeButtons =
+      getNativeModeButtons(
+        toolbar,
+      );
+
+    const selectedIndex =
+      nativeButtons.findIndex(
+        isNativeModeSelected,
+      );
+
+    if (selectedIndex >= 0) {
+      state.nativeModeSelectionIndex =
+        selectedIndex;
+    }
+  }
+
+  function suppressNativeModeSelection(
+    toolbar,
+  ) {
+    const nativeButtons =
+      getNativeModeButtons(
+        toolbar,
+      );
+
+    if (
+      state.nativeModeSelectionIndex ===
+      null
+    ) {
+      rememberNativeModeSelection(
+        toolbar,
+      );
+    }
+
+    for (
+      const button of
+      nativeButtons
+    ) {
+      button.classList.remove(
+        "btn-active",
+      );
+
+      if (
+        button.hasAttribute(
+          "aria-pressed",
+        )
+      ) {
+        button.setAttribute(
+          "aria-pressed",
+          "false",
+        );
+      }
+
+      if (
+        button.hasAttribute(
+          "aria-checked",
+        )
+      ) {
+        button.setAttribute(
+          "aria-checked",
+          "false",
+        );
+      }
+    }
+  }
+
+  function restoreNativeModeSelection(
+    toolbar,
+  ) {
+    const nativeButtons =
+      getNativeModeButtons(
+        toolbar,
+      );
+
+    const selectedIndex =
+      state.nativeModeSelectionIndex;
+
+    if (
+      selectedIndex === null ||
+      selectedIndex < 0 ||
+      selectedIndex >=
+        nativeButtons.length
+    ) {
+      state.nativeModeSelectionIndex =
+        null;
+
+      return;
+    }
+
+    nativeButtons.forEach(
+      (button, index) => {
+        const selected =
+          index === selectedIndex;
+
+        button.classList.toggle(
+          "btn-active",
+          selected,
+        );
+
+        if (
+          button.hasAttribute(
+            "aria-pressed",
+          )
+        ) {
+          button.setAttribute(
+            "aria-pressed",
+            String(selected),
+          );
+        }
+
+        if (
+          button.hasAttribute(
+            "aria-checked",
+          )
+        ) {
+          button.setAttribute(
+            "aria-checked",
+            String(selected),
+          );
+        }
+      },
+    );
+
+    state.nativeModeSelectionIndex =
+      null;
+  }
+
+  function bindNativeModeButtons(
+    toolbar,
+  ) {
+    for (
+      const button of
+      getNativeModeButtons(
+        toolbar,
+      )
+    ) {
+      if (
+        nativeModeButtonsBound.has(
+          button,
+        )
+      ) {
+        continue;
+      }
+
+      nativeModeButtonsBound.add(
+        button,
+      );
+
+      button.addEventListener(
+        "click",
+        () => {
+          if (
+            isCustomPreviewEnabled()
+          ) {
+            /*
+             * Selecting a native display mode exits an added preview
+             * mode and allows Wplace to apply the clicked mode normally.
+             */
+            setCustomPreviewMode(
+              null,
+              {
+                restoreNativeSelection:
+                  false,
+              },
+            );
+          }
+        },
+        true,
+      );
+    }
+  }
 
   function getHighlightTitle() {
     if (
@@ -3411,6 +4013,98 @@
           );
         }
       });
+
+    document
+      .querySelectorAll(
+        FULL_PREVIEW_BUTTON_SELECTOR,
+      )
+      .forEach((button) => {
+        button.classList.toggle(
+          "btn-active",
+          state.fullPreviewEnabled,
+        );
+
+        button.setAttribute(
+          "aria-pressed",
+          String(
+            state.fullPreviewEnabled,
+          ),
+        );
+
+        const title =
+          state.fullPreviewEnabled
+            ? "Restore normal template preview"
+            : "Show finished image preview";
+
+        if (
+          button.title !== title
+        ) {
+          button.title = title;
+        }
+
+        if (
+          button.getAttribute(
+            "aria-label",
+          ) !== title
+        ) {
+          button.setAttribute(
+            "aria-label",
+            title,
+          );
+        }
+      });
+
+    document
+      .querySelectorAll(
+        PLUS_PREVIEW_BUTTON_SELECTOR,
+      )
+      .forEach((button) => {
+        button.classList.toggle(
+          "btn-active",
+          state.plusPreviewEnabled,
+        );
+
+        button.setAttribute(
+          "aria-pressed",
+          String(
+            state.plusPreviewEnabled,
+          ),
+        );
+
+        const title =
+          state.plusPreviewEnabled
+            ? "Restore normal template preview"
+            : "Show plus-shaped pixel preview";
+
+        if (
+          button.title !== title
+        ) {
+          button.title = title;
+        }
+
+        if (
+          button.getAttribute(
+            "aria-label",
+          ) !== title
+        ) {
+          button.setAttribute(
+            "aria-label",
+            title,
+          );
+        }
+      });
+
+    const toolbar =
+      findOverlayToolbar();
+
+    if (
+      toolbar &&
+      isCustomPreviewEnabled()
+    ) {
+      suppressNativeModeSelection(
+        toolbar,
+      );
+    }
   }
 
   function makeToggleButton() {
@@ -3434,20 +4128,114 @@
     );
 
     button.innerHTML = `
-      <svg
-        xmlns="http://www.w3.org/2000/svg"
-        viewBox="0 0 24 24"
-        fill="currentColor"
-        class="size-3.5"
-        aria-hidden="true"
-      >
-        <path d="M13 2 4.5 13H11l-1 9L19.5 10H13V2Z"></path>
-      </svg>
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 24 24"
+  class="size-3.5"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2.5"
+  stroke-linecap="square"
+  stroke-linejoin="miter"
+  aria-hidden="true"
+>
+  <rect x="4" y="4" width="16" height="16"></rect>
+
+  <rect
+    x="9"
+    y="9"
+    width="6"
+    height="6"
+    fill="currentColor"
+    stroke="none"
+  ></rect>
+
+  <path d="M12 2v3M12 19v3M2 12h3M19 12h3"></path>
+</svg>
     `;
 
     button.addEventListener(
       "click",
       cycleHighlightMode,
+    );
+
+    return button;
+  }
+
+  function makePlusPreviewButton() {
+    const button =
+      document.createElement(
+        "button",
+      );
+
+    button.type =
+      "button";
+
+    button.className =
+      "btn btn-ghost btn-xs btn-square";
+
+    button.dataset
+      .wpttPlusPreviewToggle = "";
+
+    button.setAttribute(
+      "aria-pressed",
+      "false",
+    );
+
+    button.innerHTML =
+      PLUS_PREVIEW_ICON_MARKUP;
+
+    button.addEventListener(
+      "click",
+      () => {
+        setPlusPreviewEnabled(
+          !state.plusPreviewEnabled,
+        );
+      },
+    );
+
+    return button;
+  }
+
+  function makeFullPreviewButton() {
+    const button =
+      document.createElement(
+        "button",
+      );
+
+    button.type =
+      "button";
+
+    button.className =
+      "btn btn-ghost btn-xs btn-square";
+
+    button.dataset
+      .wpttFullPreviewToggle = "";
+
+    button.setAttribute(
+      "aria-pressed",
+      "false",
+    );
+
+    button.innerHTML =
+      state.fullPixelIconMarkup ??
+      FALLBACK_FULL_PIXEL_ICON_MARKUP;
+
+    if (
+      state.fullPixelIconMarkup
+    ) {
+      button.dataset
+        .wpttFullPixelIconApplied =
+        "true";
+    }
+
+    button.addEventListener(
+      "click",
+      () => {
+        setFullPreviewEnabled(
+          !state.fullPreviewEnabled,
+        );
+      },
     );
 
     return button;
@@ -3472,25 +4260,40 @@
 
     style.textContent = `
       /*
-       * Pulse is the second active state:
-       * visually invert the normal toolbar appearance.
+       * Pulse uses the inverse of the current theme's normal
+       * content/background colors. This keeps the second active
+       * state distinct in both light and dark themes.
        */
       .wptt-pulse-state {
-        background-color: #ffffff !important;
-        border-color: #ffffff !important;
-        color: #1f1f1f !important;
+        background-color:
+          var(--color-base-content, #ffffff) !important;
+        border-color:
+          var(--color-base-content, #ffffff) !important;
+        color:
+          var(--color-base-100, #1f1f1f) !important;
       }
 
       .wptt-pulse-state:hover {
-        background-color: #f2f2f2 !important;
-        border-color: #f2f2f2 !important;
-        color: #1f1f1f !important;
+        filter: brightness(0.92);
       }
 
       .wptt-pulse-state:active {
-        background-color: #e7e7e7 !important;
-        border-color: #e7e7e7 !important;
-        color: #1f1f1f !important;
+        filter: brightness(0.84);
+      }
+
+      /*
+       * Fallback for light themes if the DaisyUI color variables
+       * are unavailable.
+       */
+      @media (prefers-color-scheme: light) {
+        .wptt-pulse-state {
+          background-color:
+            var(--color-base-content, #1f1f1f) !important;
+          border-color:
+            var(--color-base-content, #1f1f1f) !important;
+          color:
+            var(--color-base-100, #ffffff) !important;
+        }
       }
     `;
 
@@ -3500,9 +4303,7 @@
     ).append(style);
   }
 
-  // ===========================================================================
   // Modal settings
-  // ===========================================================================
 
   function updateSettingsUi() {
     document
@@ -3548,42 +4349,6 @@
 
     document
       .querySelectorAll(
-        COLOR_NAME_SELECTOR,
-      )
-      .forEach((label) => {
-        const text =
-          `${state.color.label} · ` +
-          state.color.hex.toUpperCase();
-
-        const textNode =
-          label.firstChild;
-
-        if (
-          textNode?.nodeType ===
-          Node.TEXT_NODE
-        ) {
-          if (
-            textNode.nodeValue !==
-            text
-          ) {
-            textNode.nodeValue =
-              text;
-          }
-
-          return;
-        }
-
-        if (
-          label.textContent !==
-          text
-        ) {
-          label.textContent =
-            text;
-        }
-      });
-
-    document
-      .querySelectorAll(
         PULSE_TOGGLE_SELECTOR,
       )
       .forEach((checkbox) => {
@@ -3611,9 +4376,7 @@
     panel.className =
       "mx-4 mt-3 rounded-xl bg-base-200/60 px-3 py-2.5";
 
-    // -------------------------------------------------------------------------
     // Color row
-    // -------------------------------------------------------------------------
 
     const colorRow =
       document.createElement(
@@ -3661,7 +4424,7 @@
       );
 
     colorControls.className =
-      "flex flex-col items-end gap-1.5";
+      "flex items-center";
 
     const swatches =
       document.createElement(
@@ -3751,26 +4514,8 @@
       );
     }
 
-    const selectedName =
-      document.createElement(
-        "span",
-      );
-
-    selectedName.dataset
-      .wpttColorName = "";
-
-    selectedName.className =
-      "text-base-content/60 text-[11px] font-medium";
-
-    selectedName.append(
-      document.createTextNode(
-        `${state.color.label} · ${state.color.hex.toUpperCase()}`,
-      ),
-    );
-
     colorControls.append(
       swatches,
-      selectedName,
     );
 
     colorRow.append(
@@ -3778,9 +4523,7 @@
       colorControls,
     );
 
-    // -------------------------------------------------------------------------
     // Divider
-    // -------------------------------------------------------------------------
 
     const divider =
       document.createElement(
@@ -3790,9 +4533,7 @@
     divider.className =
       "border-base-content/10 my-2.5 border-t";
 
-    // -------------------------------------------------------------------------
     // Pulse preference
-    // -------------------------------------------------------------------------
 
     const pulseRow =
       document.createElement(
@@ -3921,9 +4662,7 @@
     return panel;
   }
 
-  // ===========================================================================
   // Wplace UI discovery
-  // ===========================================================================
 
   function findOverlayToolbar() {
     const markedToolbar =
@@ -3969,6 +4708,10 @@
           3 &&
         backButton
       ) {
+        toolbar.dataset
+          .wplaceCleanModeOverlayToolbar =
+          "true";
+
         return toolbar;
       }
     }
@@ -3976,7 +4719,7 @@
     return null;
   }
 
-  function ensureButton() {
+  function ensureToolbarButtons() {
     const toolbar =
       findOverlayToolbar();
 
@@ -3984,28 +4727,131 @@
       return;
     }
 
-    if (
-      toolbar.querySelector(
-        BUTTON_SELECTOR,
-      )
-    ) {
-      updateButtons();
-      return;
-    }
+    /*
+     * Capture and replace Wplace's original Full Pixel icon before
+     * positioning the additional controls.
+     */
+    prepareNativeModeIcons(
+      toolbar,
+    );
 
-    const firstDisplayOption =
-      toolbar.querySelector(
-        "button.btn-xs.btn-square",
+    bindNativeModeButtons(
+      toolbar,
+    );
+
+    let nativeButtons =
+      getNativeModeButtons(
+        toolbar,
       );
 
-    const button =
-      makeToggleButton();
+    const firstNativeButton =
+      nativeButtons[0] ??
+      null;
 
-    toolbar.insertBefore(
-      button,
-      firstDisplayOption ??
-        toolbar.children[1] ??
-        null,
+    let highlightButton =
+      toolbar.querySelector(
+        BUTTON_SELECTOR,
+      );
+
+    let plusPreviewButton =
+      toolbar.querySelector(
+        PLUS_PREVIEW_BUTTON_SELECTOR,
+      );
+
+    let fullPreviewButton =
+      toolbar.querySelector(
+        FULL_PREVIEW_BUTTON_SELECTOR,
+      );
+
+    if (!highlightButton) {
+      highlightButton =
+        makeToggleButton();
+
+      toolbar.insertBefore(
+        highlightButton,
+        firstNativeButton ??
+          toolbar.children[1] ??
+          null,
+      );
+    }
+
+    if (!plusPreviewButton) {
+      plusPreviewButton =
+        makePlusPreviewButton();
+    }
+
+    if (!fullPreviewButton) {
+      fullPreviewButton =
+        makeFullPreviewButton();
+    }
+
+    /*
+     * Added pixel modes follow Wplace's native modes. Finished preview
+     * stays furthest right, with plus preview directly before it.
+     */
+    nativeButtons =
+      getNativeModeButtons(
+        toolbar,
+      );
+
+    const lastNativeButton =
+      nativeButtons[
+        nativeButtons.length - 1
+      ] ?? null;
+
+if (lastNativeButton) {
+  if (
+    plusPreviewButton
+      .previousElementSibling !==
+    lastNativeButton
+  ) {
+    lastNativeButton.after(
+      plusPreviewButton,
+    );
+  }
+
+  if (
+    fullPreviewButton
+      .previousElementSibling !==
+    plusPreviewButton
+  ) {
+    plusPreviewButton.after(
+      fullPreviewButton,
+    );
+  }
+} else {
+      const backButton =
+        toolbar.querySelector(
+          ":scope > button.btn-sm.shrink-0:not(.btn-square)",
+        );
+
+      if (
+        !plusPreviewButton.isConnected
+      ) {
+        toolbar.insertBefore(
+          plusPreviewButton,
+          backButton ?? null,
+        );
+      }
+
+      if (
+        !fullPreviewButton.isConnected
+      ) {
+        plusPreviewButton.after(
+          fullPreviewButton,
+        );
+      }
+    }
+
+    /*
+     * Reapply icon replacements if Wplace rebuilt the toolbar.
+     */
+    prepareNativeModeIcons(
+      toolbar,
+    );
+
+    bindNativeModeButtons(
+      toolbar,
     );
 
     updateButtons();
@@ -4054,16 +4900,14 @@
 
   function ensureUi() {
     ensureToolbarStyles();
-    ensureButton();
+    ensureToolbarButtons();
     ensureSettingsPanel();
   }
 
   state.ensureUi =
     ensureUi;
 
-  // ===========================================================================
   // DOM observer
-  // ===========================================================================
 
   let ensureScheduled = false;
 
@@ -4092,9 +4936,7 @@
 
   ensureUi();
 
-  // ===========================================================================
   // Public API
-  // ===========================================================================
 
   globalThis.wplaceTemplateTools = {
     refresh:
@@ -4125,7 +4967,7 @@
       }
 
       return {
-        version: "0.6.1",
+        version: "1.2.0",
 
         highlight:
           state.highlightMode ===
@@ -4138,6 +4980,12 @@
 
         pulseEnabled:
           state.pulseEnabled,
+
+        fullPreview:
+          state.fullPreviewEnabled,
+
+        plusPreview:
+          state.plusPreviewEnabled,
 
         color:
           state.color.id,

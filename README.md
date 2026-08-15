@@ -2,7 +2,13 @@
 
 A Tampermonkey userscript that adds extra controls to the template overlay toolbar on [wplace.live](https://wplace.live/).
 
-Right now it only adds one new tool, but I plan to add others.
+## Features
+* Highlight toggle to spot missing pixels more easily
+* Configurable pulse mode for highlight, making it even more noticeable
+* Swappable highlight color in template modal
+* New +-shaped preview pixels for your overlays
+* Finished image preview so you can see what it will look like when complete
+* Gives 'full pixel' transparency mode a new icon to better represent what it does and gives the old icon to the new "finished image preview" option
 
 ## Highlight Toggle
 
@@ -12,7 +18,7 @@ Note that you can still freely change the shape of your preview pixels or sort t
 
 Choose the visibility color from the **Preview visibility color** setting at the top of Wplace's Overlays modal. The selected preset is saved across reloads. Available colors are:
 
-- Magenta (`#ff00ff`)
+- Neon magenta (`#ff00ff`)
 - Neon green (`#39ff14`)
 - Neon yellow (`#fff01f`)
 - Neon orange (`#ff5f1f`)
