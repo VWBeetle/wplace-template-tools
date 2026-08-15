@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      0.5.0
+// @version      0.6.0
 // @description  Adds visibility tools to Wplace's template overlay toolbar.
 // @author       VWBeetle
 // @match        https://wplace.live/*
@@ -33,6 +33,9 @@
   const MASK_READY_UNIFORM_NAME =
     "u_wptt_mismatch_mask_ready";
 
+  const PULSE_BRIGHTNESS_UNIFORM_NAME =
+    "u_wptt_pulse_brightness";
+
   const BUTTON_SELECTOR =
     "[data-wptt-magenta-toggle]";
 
@@ -42,8 +45,11 @@
   const COLOR_NAME_SELECTOR =
     "[data-wptt-color-name]";
 
-  const COLOR_PICKER_SELECTOR =
-    "[data-wptt-color-picker]";
+  const SETTINGS_SELECTOR =
+    "[data-wptt-settings]";
+
+  const PULSE_TOGGLE_SELECTOR =
+    "[data-wptt-enable-pulse]";
 
   const CHECKMARK_SELECTOR =
     "[data-wptt-checkmark]";
@@ -51,8 +57,11 @@
   const TOOLBAR_SELECTOR =
     '[data-wplace-clean-mode-overlay-toolbar="true"]';
 
-  const STORAGE_KEY =
+  const COLOR_STORAGE_KEY =
     "wplace-template-tools.preview-color";
+
+  const PULSE_STORAGE_KEY =
+    "wplace-template-tools.enable-pulse";
 
   const ARTWORK_TILE_ZOOM = 11;
 
@@ -62,16 +71,8 @@
   const ARTWORK_TILE_ROOT =
     "https://backend.wplace.live/files/s0/tiles";
 
-  /*
-   * Periodic fallback in case artwork changes without a fetch mutation
-   * that we can observe.
-   */
   const COMPARISON_REFRESH_MS = 15_000;
 
-  /*
-   * After a successful mutating request to Wplace's backend, give the
-   * artwork tile a moment to update and then refresh the comparison.
-   */
   const MUTATION_REFRESH_DELAY_MS = 1_000;
 
   const COLOR_TOLERANCE = 2;
@@ -81,6 +82,23 @@
   const MAX_MASKS_PER_PROGRAM = 6;
 
   const MAP_CAPTURE_TIMEOUT_MS = 3_000;
+
+  /*
+   * Subtle brightness pulse:
+   *
+   * 94% -> 100% -> 94%
+   *
+   * The map only needs to repaint about 30 times per second for this
+   * to look smooth.
+   */
+  const PULSE_MIN_BRIGHTNESS = 0.35;
+  const PULSE_MAX_BRIGHTNESS = 1.0;
+  const PULSE_PERIOD_MS = 3_000;
+  const PULSE_FRAME_INTERVAL_MS = 1_000 / 30;
+
+  const HIGHLIGHT_OFF = 0;
+  const HIGHLIGHT_SOLID = 1;
+  const HIGHLIGHT_PULSE = 2;
 
   const COLOR_PRESETS = Object.freeze([
     {
@@ -130,7 +148,14 @@
 
   const state = {
     color: loadSavedColor(),
-    enabled: false,
+    pulseEnabled: loadPulseEnabled(),
+
+    /*
+     * Active highlight state is intentionally NOT persisted.
+     */
+    highlightMode: HIGHLIGHT_OFF,
+
+    pulseBrightness: 1,
 
     map: null,
     mapPromise: null,
@@ -149,9 +174,6 @@
   const templatePixelCache =
     new WeakMap();
 
-  /*
-   * Cache decoded artwork PNGs by tile and refresh generation.
-   */
   const artworkTileCache =
     new Map();
 
@@ -161,6 +183,9 @@
 
   let mutationRefreshTimer = 0;
 
+  let pulseAnimationFrame = 0;
+  let lastPulseFrameTime = 0;
+
   // ===========================================================================
   // Settings
   // ===========================================================================
@@ -169,7 +194,7 @@
     try {
       const savedId =
         globalThis.localStorage?.getItem(
-          STORAGE_KEY,
+          COLOR_STORAGE_KEY,
         );
 
       return (
@@ -186,8 +211,35 @@
   function saveColor(color) {
     try {
       globalThis.localStorage?.setItem(
-        STORAGE_KEY,
+        COLOR_STORAGE_KEY,
         color.id,
+      );
+    } catch {
+      // Persistence is optional.
+    }
+  }
+
+  function loadPulseEnabled() {
+    try {
+      const saved =
+        globalThis.localStorage?.getItem(
+          PULSE_STORAGE_KEY,
+        );
+
+      /*
+       * Default to enabled.
+       */
+      return saved !== "false";
+    } catch {
+      return true;
+    }
+  }
+
+  function savePulseEnabled(enabled) {
+    try {
+      globalThis.localStorage?.setItem(
+        PULSE_STORAGE_KEY,
+        String(enabled),
       );
     } catch {
       // Persistence is optional.
@@ -509,6 +561,7 @@
           `uniform vec3 ${COLOR_UNIFORM_NAME};`,
           `uniform sampler2D ${MASK_UNIFORM_NAME};`,
           `uniform bool ${MASK_READY_UNIFORM_NAME};`,
+          `uniform float ${PULSE_BRIGHTNESS_UNIFORM_NAME};`,
         ].join("\n"),
       );
 
@@ -520,8 +573,9 @@
         `    ${MASK_UNIFORM_NAME},`,
         `    (source_pixel + 0.5) / u_source_size`,
         `  ).r;`,
+        ``,
         `  if (wptt_mismatch > 0.5) {`,
-        `    color.rgb = ${COLOR_UNIFORM_NAME};`,
+        `    color.rgb = ${COLOR_UNIFORM_NAME} * ${PULSE_BRIGHTNESS_UNIFORM_NAME};`,
         `  }`,
         `}`,
         colorNeedle,
@@ -590,6 +644,13 @@
           MASK_READY_UNIFORM_NAME,
         ),
 
+      pulseBrightness:
+        native.getUniformLocation.call(
+          gl,
+          program,
+          PULSE_BRIGHTNESS_UNIFORM_NAME,
+        ),
+
       texture:
         native.getUniformLocation.call(
           gl,
@@ -649,11 +710,10 @@
 
     if (
       locations.enabled === null ||
-      locations.previewColor ===
-        null ||
+      locations.previewColor === null ||
       locations.mask === null ||
-      locations.maskReady ===
-        null ||
+      locations.maskReady === null ||
+      locations.pulseBrightness === null ||
       locations.matrix === null ||
       locations.worldSize === null
     ) {
@@ -697,10 +757,10 @@
 
     state.records.add(record);
 
-    setProgramUniform(record);
+    setProgramUniforms(record);
   }
 
-  function setProgramUniform(record) {
+  function setProgramUniforms(record) {
     const {
       gl,
       native,
@@ -729,7 +789,10 @@
       native.uniform1i.call(
         gl,
         locations.enabled,
-        state.enabled ? 1 : 0,
+        state.highlightMode !==
+          HIGHLIGHT_OFF
+          ? 1
+          : 0,
       );
 
       native.uniform3f.call(
@@ -738,6 +801,12 @@
         state.color.rgb[0],
         state.color.rgb[1],
         state.color.rgb[2],
+      );
+
+      native.uniform1f.call(
+        gl,
+        locations.pulseBrightness,
+        state.pulseBrightness,
       );
 
       native.useProgram.call(
@@ -749,6 +818,50 @@
         "[Wplace Template Tools] Could not update overlay uniforms.",
         error,
       );
+    }
+  }
+
+  function setPulseBrightnessUniform(
+    record,
+    brightness,
+  ) {
+    const {
+      gl,
+      native,
+      program,
+      locations,
+    } = record;
+
+    try {
+      if (
+        native.isContextLost?.call(gl)
+      ) {
+        return;
+      }
+
+      const previousProgram =
+        native.getParameter.call(
+          gl,
+          gl.CURRENT_PROGRAM,
+        );
+
+      native.useProgram.call(
+        gl,
+        program,
+      );
+
+      native.uniform1f.call(
+        gl,
+        locations.pulseBrightness,
+        brightness,
+      );
+
+      native.useProgram.call(
+        gl,
+        previousProgram,
+      );
+    } catch {
+      // Animation should never interfere with Wplace.
     }
   }
 
@@ -1026,12 +1139,6 @@
       const textureId =
         getTextureId(texture);
 
-      /*
-       * Camera matrix is intentionally omitted.
-       *
-       * These values identify the template itself and its geographic
-       * placement. The camera may move without changing either.
-       */
       const key =
         [
           textureId,
@@ -2335,10 +2442,6 @@
     const token =
       ++entry.buildToken;
 
-    /*
-     * Geographic lookup uses the current camera matrix once, when the
-     * template is first encountered. Copy it before async work begins.
-     */
     const buildDrawInfo = {
       ...drawInfo,
 
@@ -2542,7 +2645,8 @@
 
     if (
       !record ||
-      !state.enabled
+      state.highlightMode ===
+        HIGHLIGHT_OFF
     ) {
       return draw();
     }
@@ -2675,6 +2779,9 @@
 
       texParameteri:
         prototype.texParameteri,
+
+      uniform1f:
+        prototype.uniform1f,
 
       uniform1i:
         prototype.uniform1i,
@@ -2828,15 +2935,146 @@
   );
 
   // ===========================================================================
+  // Pulse animation
+  // ===========================================================================
+
+  function setPulseBrightness(
+    brightness,
+  ) {
+    if (
+      Math.abs(
+        state.pulseBrightness -
+          brightness,
+      ) < 0.0001
+    ) {
+      return;
+    }
+
+    state.pulseBrightness =
+      brightness;
+
+    state.records.forEach(
+      (record) => {
+        setPulseBrightnessUniform(
+          record,
+          brightness,
+        );
+      },
+    );
+  }
+
+  function stopPulseAnimation() {
+    if (pulseAnimationFrame) {
+      cancelAnimationFrame(
+        pulseAnimationFrame,
+      );
+
+      pulseAnimationFrame = 0;
+    }
+
+    lastPulseFrameTime = 0;
+
+    setPulseBrightness(1);
+  }
+
+  function startPulseAnimation() {
+    if (pulseAnimationFrame) {
+      return;
+    }
+
+    const animate = (time) => {
+      if (
+        state.highlightMode !==
+          HIGHLIGHT_PULSE ||
+        !state.pulseEnabled
+      ) {
+        pulseAnimationFrame = 0;
+        lastPulseFrameTime = 0;
+
+        setPulseBrightness(1);
+
+        requestMapRepaint();
+
+        return;
+      }
+
+      if (
+        !lastPulseFrameTime ||
+        time - lastPulseFrameTime >=
+          PULSE_FRAME_INTERVAL_MS
+      ) {
+        lastPulseFrameTime =
+          time;
+
+        /*
+         * cosine starts at full brightness:
+         *
+         * 1 -> 0 -> 1
+         */
+        const phase =
+          (
+            time %
+            PULSE_PERIOD_MS
+          ) /
+          PULSE_PERIOD_MS;
+
+        const wave =
+          (
+            Math.cos(
+              phase *
+                Math.PI *
+                2,
+            ) +
+            1
+          ) /
+          2;
+
+        const brightness =
+          PULSE_MIN_BRIGHTNESS +
+          (
+            PULSE_MAX_BRIGHTNESS -
+            PULSE_MIN_BRIGHTNESS
+          ) *
+            wave;
+
+        setPulseBrightness(
+          brightness,
+        );
+
+        requestMapRepaint();
+      }
+
+      pulseAnimationFrame =
+        requestAnimationFrame(
+          animate,
+        );
+    };
+
+    pulseAnimationFrame =
+      requestAnimationFrame(
+        animate,
+      );
+  }
+
+  function syncPulseAnimation() {
+    if (
+      state.highlightMode ===
+        HIGHLIGHT_PULSE &&
+      state.pulseEnabled
+    ) {
+      startPulseAnimation();
+    } else {
+      stopPulseAnimation();
+    }
+  }
+
+  // ===========================================================================
   // Refresh handling
   // ===========================================================================
 
   function refreshComparison() {
     artworkGeneration += 1;
 
-    /*
-     * Old generations are never used again.
-     */
     artworkTileCache.clear();
 
     requestMapRepaint();
@@ -2852,7 +3090,10 @@
         () => {
           mutationRefreshTimer = 0;
 
-          if (state.enabled) {
+          if (
+            state.highlightMode !==
+            HIGHLIGHT_OFF
+          ) {
             refreshComparison();
           }
         },
@@ -2860,10 +3101,6 @@
       );
   }
 
-  /*
-   * Observe successful Wplace backend mutations without changing
-   * the request or response.
-   */
   function installFetchMutationWatcher() {
     const nativeFetch =
       globalThis.fetch;
@@ -2893,11 +3130,12 @@
             ? input
             : null;
 
-        const url = new URL(
-          request?.url ??
-            String(input),
-          location.href,
-        );
+        const url =
+          new URL(
+            request?.url ??
+              String(input),
+            location.href,
+          );
 
         const method =
           (
@@ -2920,7 +3158,7 @@
           scheduleMutationRefresh();
         }
       } catch {
-        // Never allow refresh detection to interfere with Wplace.
+        // Never interfere with Wplace.
       }
 
       return response;
@@ -2942,7 +3180,10 @@
 
   setInterval(
     () => {
-      if (state.enabled) {
+      if (
+        state.highlightMode !==
+        HIGHLIGHT_OFF
+      ) {
         refreshComparison();
       }
     },
@@ -2950,35 +3191,67 @@
   );
 
   // ===========================================================================
-  // UI state
+  // Highlight state
   // ===========================================================================
 
-  function setEnabled(enabled) {
+  function getNextHighlightMode() {
     if (
-      state.enabled === enabled
+      state.highlightMode ===
+      HIGHLIGHT_OFF
+    ) {
+      return HIGHLIGHT_SOLID;
+    }
+
+    if (
+      state.highlightMode ===
+      HIGHLIGHT_SOLID
+    ) {
+      return state.pulseEnabled
+        ? HIGHLIGHT_PULSE
+        : HIGHLIGHT_OFF;
+    }
+
+    return HIGHLIGHT_OFF;
+  }
+
+  function setHighlightMode(mode) {
+    if (
+      state.highlightMode === mode
     ) {
       return;
     }
 
-    state.enabled =
-      enabled;
+    const wasOff =
+      state.highlightMode ===
+      HIGHLIGHT_OFF;
+
+    state.highlightMode =
+      mode;
 
     state.records.forEach(
-      setProgramUniform,
+      setProgramUniforms,
     );
 
-    if (enabled) {
+    if (
+      wasOff &&
+      mode !== HIGHLIGHT_OFF
+    ) {
       void getMapInstance();
 
-      /*
-       * Force fresh artwork rather than displaying an old mask from
-       * a previous activation.
-       */
       refreshComparison();
     }
 
+    syncPulseAnimation();
+
     updateButtons();
+
     requestMapRepaint();
+  }
+
+  function cycleHighlightMode() {
+    setHighlightMode(
+      getNextHighlightMode(),
+    );
   }
 
   function setColor(colorId) {
@@ -2998,21 +3271,79 @@
     saveColor(color);
 
     state.records.forEach(
-      setProgramUniform,
+      setProgramUniforms,
     );
 
     updateButtons();
-    updateColorPickers();
+    updateSettingsUi();
+    requestMapRepaint();
+  }
+
+  function setPulseEnabled(enabled) {
+    enabled =
+      Boolean(enabled);
+
+    if (
+      state.pulseEnabled ===
+      enabled
+    ) {
+      return;
+    }
+
+    state.pulseEnabled =
+      enabled;
+
+    savePulseEnabled(
+      enabled,
+    );
+
+    /*
+     * If Pulse is currently active and the user removes it from the
+     * cycle, fall back to Solid rather than abruptly turning the whole
+     * highlight feature off.
+     */
+    if (
+      !enabled &&
+      state.highlightMode ===
+        HIGHLIGHT_PULSE
+    ) {
+      state.highlightMode =
+        HIGHLIGHT_SOLID;
+
+      state.records.forEach(
+        setProgramUniforms,
+      );
+    }
+
+    syncPulseAnimation();
+
+    updateButtons();
+    updateSettingsUi();
+
     requestMapRepaint();
   }
 
   function requestMapRepaint() {
-    requestAnimationFrame(
-      () => {
-        globalThis.dispatchEvent(
-          new Event("resize"),
-        );
-      },
+    /*
+     * MapLibre provides a much lighter repaint mechanism than forcing
+     * a window resize. Use it when available.
+     */
+    if (
+      state.map &&
+      typeof state.map
+        .triggerRepaint ===
+        "function"
+    ) {
+      try {
+        state.map.triggerRepaint();
+        return;
+      } catch {
+        // Fall through.
+      }
+    }
+
+    globalThis.dispatchEvent(
+      new Event("resize"),
     );
   }
 
@@ -3020,32 +3351,73 @@
   // Toolbar button
   // ===========================================================================
 
+  function getHighlightTitle() {
+    if (
+      state.highlightMode ===
+      HIGHLIGHT_OFF
+    ) {
+      return state.pulseEnabled
+        ? `Highlight unfinished pixels in ${state.color.label.toLowerCase()}`
+        : `Highlight unfinished pixels in ${state.color.label.toLowerCase()}`;
+    }
+
+    if (
+      state.highlightMode ===
+      HIGHLIGHT_SOLID
+    ) {
+      return state.pulseEnabled
+        ? "Unfinished pixels highlighted — click to pulse"
+        : "Unfinished pixels highlighted — click to turn off";
+    }
+
+    return "Unfinished pixels pulsing — click to turn off";
+  }
+
   function updateButtons() {
     document
       .querySelectorAll(
         BUTTON_SELECTOR,
       )
       .forEach((button) => {
+        const active =
+          state.highlightMode !==
+          HIGHLIGHT_OFF;
+
+        const pulsing =
+          state.highlightMode ===
+          HIGHLIGHT_PULSE;
+
         button.classList.toggle(
           "btn-active",
-          state.enabled,
+          active,
         );
+
+        button.classList.toggle(
+          "wptt-toolbar-pulsing",
+          pulsing,
+        );
+
+        button.dataset.wpttState =
+          state.highlightMode ===
+          HIGHLIGHT_OFF
+            ? "off"
+            : state.highlightMode ===
+                HIGHLIGHT_SOLID
+              ? "solid"
+              : "pulse";
 
         button.setAttribute(
           "aria-pressed",
-          String(state.enabled),
+          String(active),
         );
 
         const title =
-          state.enabled
-            ? "Stop highlighting unfinished template pixels"
-            : `Highlight unfinished template pixels in ${state.color.label.toLowerCase()}`;
+          getHighlightTitle();
 
         if (
           button.title !== title
         ) {
-          button.title =
-            title;
+          button.title = title;
         }
 
         if (
@@ -3083,6 +3455,7 @@
 
     button.innerHTML = `
       <svg
+        data-wptt-lightning-icon
         xmlns="http://www.w3.org/2000/svg"
         viewBox="0 0 24 24"
         fill="currentColor"
@@ -3095,21 +3468,65 @@
 
     button.addEventListener(
       "click",
-      () => {
-        setEnabled(
-          !state.enabled,
-        );
-      },
+      cycleHighlightMode,
     );
 
     return button;
   }
 
+  function ensureToolbarStyles() {
+    if (
+      document.querySelector(
+        "[data-wptt-toolbar-styles]",
+      )
+    ) {
+      return;
+    }
+
+    const style =
+      document.createElement(
+        "style",
+      );
+
+    style.dataset
+      .wpttToolbarStyles = "";
+
+    style.textContent = `
+      @keyframes wptt-toolbar-pulse {
+        0%, 100% {
+          opacity: 1;
+          transform: scale(1);
+        }
+
+        50% {
+          opacity: 0.72;
+          transform: scale(0.88);
+        }
+      }
+
+      .wptt-toolbar-pulsing [data-wptt-lightning-icon] {
+        animation: wptt-toolbar-pulse 2s ease-in-out infinite;
+        transform-origin: center;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .wptt-toolbar-pulsing [data-wptt-lightning-icon] {
+          animation: none;
+        }
+      }
+    `;
+
+    (
+      document.head ??
+      document.documentElement
+    ).append(style);
+  }
+
   // ===========================================================================
-  // Color picker
+  // Modal settings
   // ===========================================================================
 
-  function updateColorPickers() {
+  function updateSettingsUi() {
     document
       .querySelectorAll(
         COLOR_BUTTON_SELECTOR,
@@ -3186,63 +3603,86 @@
             text;
         }
       });
+
+    document
+      .querySelectorAll(
+        PULSE_TOGGLE_SELECTOR,
+      )
+      .forEach((checkbox) => {
+        checkbox.checked =
+          state.pulseEnabled;
+
+        checkbox.setAttribute(
+          "aria-checked",
+          String(
+            state.pulseEnabled,
+          ),
+        );
+      });
   }
 
-  function makeColorPicker() {
-    const picker =
+  function makeSettingsPanel() {
+    const panel =
       document.createElement(
         "section",
       );
 
-    picker.dataset
-      .wpttColorPicker = "";
+    panel.dataset.wpttSettings =
+      "";
 
-    picker.className =
-      "mx-4 mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-base-200/60 px-3 py-2.5";
+    panel.className =
+      "mx-4 mt-3 rounded-xl bg-base-200/60 px-3 py-2.5";
 
-    picker.setAttribute(
-      "aria-label",
-      "Unfinished pixel highlight color",
-    );
+    // -------------------------------------------------------------------------
+    // Color row
+    // -------------------------------------------------------------------------
 
-    const copy =
+    const colorRow =
       document.createElement(
         "div",
       );
 
-    const title =
+    colorRow.className =
+      "flex flex-wrap items-center justify-between gap-3";
+
+    const colorCopy =
+      document.createElement(
+        "div",
+      );
+
+    const colorTitle =
       document.createElement(
         "p",
       );
 
-    title.className =
+    colorTitle.className =
       "text-sm font-medium";
 
-    title.textContent =
+    colorTitle.textContent =
       "Highlight color";
 
-    const description =
+    const colorDescription =
       document.createElement(
         "p",
       );
 
-    description.className =
+    colorDescription.className =
       "text-base-content/50 text-xs";
 
-    description.textContent =
+    colorDescription.textContent =
       "Used for template pixels that still need work";
 
-    copy.append(
-      title,
-      description,
+    colorCopy.append(
+      colorTitle,
+      colorDescription,
     );
 
-    const controls =
+    const colorControls =
       document.createElement(
         "div",
       );
 
-    controls.className =
+    colorControls.className =
       "flex flex-col items-end gap-1.5";
 
     const swatches =
@@ -3350,16 +3790,117 @@
       ),
     );
 
-    controls.append(
+    colorControls.append(
       swatches,
       selectedName,
     );
 
-    picker.append(
-      copy,
-      controls,
+    colorRow.append(
+      colorCopy,
+      colorControls,
     );
 
+    // -------------------------------------------------------------------------
+    // Divider
+    // -------------------------------------------------------------------------
+
+    const divider =
+      document.createElement(
+        "div",
+      );
+
+    divider.className =
+      "border-base-content/10 my-2.5 border-t";
+
+    // -------------------------------------------------------------------------
+    // Pulse preference row
+    // -------------------------------------------------------------------------
+
+    const pulseRow =
+      document.createElement(
+        "label",
+      );
+
+    pulseRow.className =
+      "flex cursor-pointer items-center justify-between gap-4";
+
+    const pulseCopy =
+      document.createElement(
+        "div",
+      );
+
+    const pulseTitle =
+      document.createElement(
+        "p",
+      );
+
+    pulseTitle.className =
+      "text-sm font-medium";
+
+    pulseTitle.textContent =
+      "Enable pulse mode";
+
+    const pulseDescription =
+      document.createElement(
+        "p",
+      );
+
+    pulseDescription.className =
+      "text-base-content/50 text-xs";
+
+    pulseDescription.textContent =
+      "Adds Pulse to the highlight button cycle";
+
+    pulseCopy.append(
+      pulseTitle,
+      pulseDescription,
+    );
+
+    const pulseToggle =
+      document.createElement(
+        "input",
+      );
+
+    pulseToggle.type =
+      "checkbox";
+
+    pulseToggle.className =
+      "toggle toggle-sm";
+
+    pulseToggle.dataset
+      .wpttEnablePulse = "";
+
+    pulseToggle.checked =
+      state.pulseEnabled;
+
+    pulseToggle.setAttribute(
+      "aria-label",
+      "Enable pulse mode",
+    );
+
+    pulseToggle.addEventListener(
+      "change",
+      () => {
+        setPulseEnabled(
+          pulseToggle.checked,
+        );
+      },
+    );
+
+    pulseRow.append(
+      pulseCopy,
+      pulseToggle,
+    );
+
+    panel.append(
+      colorRow,
+      divider,
+      pulseRow,
+    );
+
+    /*
+     * Initialize before inserting into the document.
+     */
     for (
       const button of
       swatches.querySelectorAll(
@@ -3402,7 +3943,7 @@
       }
     }
 
-    return picker;
+    return panel;
   }
 
   // ===========================================================================
@@ -3495,7 +4036,7 @@
     updateButtons();
   }
 
-  function ensureColorPicker() {
+  function ensureSettingsPanel() {
     const templateInput =
       document.querySelector(
         "#template-file-input",
@@ -3524,21 +4065,22 @@
 
     if (
       !dialog.querySelector(
-        COLOR_PICKER_SELECTOR,
+        SETTINGS_SELECTOR,
       )
     ) {
       container.insertBefore(
-        makeColorPicker(),
+        makeSettingsPanel(),
         gallery,
       );
     }
 
-    updateColorPickers();
+    updateSettingsUi();
   }
 
   function ensureUi() {
+    ensureToolbarStyles();
     ensureButton();
-    ensureColorPicker();
+    ensureSettingsPanel();
   }
 
   state.ensureUi =
@@ -3560,6 +4102,7 @@
 
       queueMicrotask(() => {
         ensureScheduled = false;
+
         ensureUi();
       });
     });
@@ -3575,7 +4118,7 @@
   ensureUi();
 
   // ===========================================================================
-  // Small public API
+  // Public API
   // ===========================================================================
 
   globalThis.wplaceTemplateTools = {
@@ -3607,11 +4150,26 @@
       }
 
       return {
-        version: "0.5.0",
-        enabled: state.enabled,
-        color: state.color.id,
+        version: "0.6.0",
+
+        highlight:
+          state.highlightMode ===
+          HIGHLIGHT_OFF
+            ? "off"
+            : state.highlightMode ===
+                HIGHLIGHT_SOLID
+              ? "solid"
+              : "pulse",
+
+        pulseEnabled:
+          state.pulseEnabled,
+
+        color:
+          state.color.id,
+
         mapCaptured:
           Boolean(state.map),
+
         compared,
         mismatches,
       };
