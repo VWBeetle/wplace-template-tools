@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.1.1
+// @version      1.1.2
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
@@ -48,8 +48,8 @@
   const BUTTON_SELECTOR =
     "[data-wptt-magenta-toggle]";
 
-  const FULL_PREVIEW_BUTTON_SELECTOR =
-    "[data-wptt-full-preview-toggle]";
+  const FULL_PIXEL_TOGGLE_SELECTOR =
+    "[data-wptt-full-pixel-toggle]";
 
   const PLUS_PREVIEW_BUTTON_SELECTOR =
     "[data-wptt-plus-preview-toggle]";
@@ -3639,9 +3639,6 @@
           BUTTON_SELECTOR,
         ) &&
         !button.matches(
-          FULL_PREVIEW_BUTTON_SELECTOR,
-        ) &&
-        !button.matches(
           PLUS_PREVIEW_BUTTON_SELECTOR,
         ),
     );
@@ -3670,6 +3667,15 @@
   function findNativeFullPixelButton(
     toolbar,
   ) {
+    const markedButton =
+      toolbar?.querySelector(
+        FULL_PIXEL_TOGGLE_SELECTOR,
+      );
+
+    if (markedButton) {
+      return markedButton;
+    }
+
     const nativeButtons =
       getNativeModeButtons(
         toolbar,
@@ -3745,6 +3751,9 @@
       return;
     }
 
+    fullPixelButton.dataset
+      .wpttFullPixelToggle = "";
+
     const currentSvg =
       fullPixelButton.querySelector(
         "svg",
@@ -3761,8 +3770,20 @@
         currentSvg.outerHTML;
     }
 
-    if (
-      !fullPixelButton.querySelector(
+    if (state.fullPreviewEnabled) {
+      if (
+        currentSvg?.matches(
+          "[data-wptt-checkerboard-svg]",
+        )
+      ) {
+        replaceButtonSvg(
+          fullPixelButton,
+          state.fullPixelIconMarkup ??
+            FALLBACK_FULL_PIXEL_ICON_MARKUP,
+        );
+      }
+    } else if (
+      !currentSvg?.matches(
         "[data-wptt-checkerboard-svg]",
       )
     ) {
@@ -3770,25 +3791,6 @@
         fullPixelButton,
         CHECKERBOARD_ICON_MARKUP,
       );
-    }
-
-    const previewButton =
-      toolbar.querySelector(
-        FULL_PREVIEW_BUTTON_SELECTOR,
-      );
-
-    if (
-      previewButton &&
-      state.fullPixelIconMarkup &&
-      !previewButton.dataset
-        .wpttFullPixelIconApplied
-    ) {
-      previewButton.innerHTML =
-        state.fullPixelIconMarkup;
-
-      previewButton.dataset
-        .wpttFullPixelIconApplied =
-        "true";
     }
   }
 
@@ -3940,6 +3942,11 @@
   function bindNativeModeButtons(
     toolbar,
   ) {
+    const fullPixelButton =
+      findNativeFullPixelButton(
+        toolbar,
+      );
+
     for (
       const button of
       getNativeModeButtons(
@@ -3958,6 +3965,87 @@
         button,
       );
 
+      if (button === fullPixelButton) {
+        button.addEventListener(
+          "click",
+          (event) => {
+            /*
+             * Finished preview is the second state of Wplace's native
+             * Full Pixel control. Clicking it again returns to the
+             * semi-transparent Full Pixel state without invoking Wplace.
+             */
+            if (
+              state.fullPreviewEnabled
+            ) {
+              event.preventDefault();
+              event.stopImmediatePropagation();
+
+              setFullPreviewEnabled(
+                false,
+                {
+                  restoreNativeSelection:
+                    false,
+                },
+              );
+
+              return;
+            }
+
+            /*
+             * From another display mode, the first click is left to
+             * Wplace so its normal semi-transparent Full Pixel state
+             * is selected. Plus preview is cleared before that click.
+             */
+            if (
+              state.plusPreviewEnabled ||
+              !isNativeModeSelected(
+                button,
+              )
+            ) {
+              if (
+                state.plusPreviewEnabled
+              ) {
+                setCustomPreviewMode(
+                  null,
+                  {
+                    restoreNativeSelection:
+                      false,
+                  },
+                );
+              }
+
+              queueMicrotask(() => {
+                prepareNativeModeIcons(
+                  toolbar,
+                );
+
+                updateButtons();
+              });
+
+              return;
+            }
+
+            /*
+             * Full Pixel is already selected, so the next click advances
+             * the same control to the finished-preview state.
+             */
+            event.preventDefault();
+            event.stopImmediatePropagation();
+
+            setFullPreviewEnabled(
+              true,
+              {
+                restoreNativeSelection:
+                  false,
+              },
+            );
+          },
+          true,
+        );
+
+        continue;
+      }
+
       button.addEventListener(
         "click",
         () => {
@@ -3965,8 +4053,8 @@
             isCustomPreviewEnabled()
           ) {
             /*
-             * Selecting a native display mode exits an added preview
-             * mode and allows Wplace to apply the clicked mode normally.
+             * Selecting another native display mode exits an added
+             * preview mode and allows Wplace to apply the clicked mode.
              */
             setCustomPreviewMode(
               null,
@@ -4065,25 +4153,18 @@
 
     document
       .querySelectorAll(
-        FULL_PREVIEW_BUTTON_SELECTOR,
+        FULL_PIXEL_TOGGLE_SELECTOR,
       )
       .forEach((button) => {
-        button.classList.toggle(
-          "btn-active",
-          state.fullPreviewEnabled,
-        );
-
-        button.setAttribute(
-          "aria-pressed",
-          String(
-            state.fullPreviewEnabled,
-          ),
-        );
+        button.dataset.wpttState =
+          state.fullPreviewEnabled
+            ? "finished"
+            : "transparent";
 
         const title =
           state.fullPreviewEnabled
-            ? "Restore normal template preview"
-            : "Show finished image preview";
+            ? "Finished template preview — click for semi-transparent preview"
+            : "Semi-transparent template preview — click for finished preview";
 
         if (
           button.title !== title
@@ -4146,11 +4227,21 @@
     const toolbar =
       findOverlayToolbar();
 
-    if (
-      toolbar &&
-      isCustomPreviewEnabled()
-    ) {
-      suppressNativeModeSelection(
+    if (toolbar) {
+      /*
+       * Plus preview is a separate custom display mode, so native mode
+       * selection is hidden while it is active. Finished preview remains
+       * visibly attached to the native Full Pixel button.
+       */
+      if (
+        state.plusPreviewEnabled
+      ) {
+        suppressNativeModeSelection(
+          toolbar,
+        );
+      }
+
+      prepareNativeModeIcons(
         toolbar,
       );
     }
@@ -4246,50 +4337,6 @@
     return button;
   }
 
-  function makeFullPreviewButton() {
-    const button =
-      document.createElement(
-        "button",
-      );
-
-    button.type =
-      "button";
-
-    button.className =
-      "btn btn-ghost btn-xs btn-square";
-
-    button.dataset
-      .wpttFullPreviewToggle = "";
-
-    button.setAttribute(
-      "aria-pressed",
-      "false",
-    );
-
-    button.innerHTML =
-      state.fullPixelIconMarkup ??
-      FALLBACK_FULL_PIXEL_ICON_MARKUP;
-
-    if (
-      state.fullPixelIconMarkup
-    ) {
-      button.dataset
-        .wpttFullPixelIconApplied =
-        "true";
-    }
-
-    button.addEventListener(
-      "click",
-      () => {
-        setFullPreviewEnabled(
-          !state.fullPreviewEnabled,
-        );
-      },
-    );
-
-    return button;
-  }
-
   function ensureToolbarStyles() {
     if (
       document.querySelector(
@@ -4345,21 +4392,42 @@
         }
       }
 
+      button[title="Highlight selected color"],
+      button[title="Show all colors"] {
+        height: 1.75rem !important;
+        width: 1.75rem !important;
+        min-height: 1.75rem !important;
+        min-width: 1.75rem !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+      }
+
       [data-wptt-back-button] {
-        width: 2rem !important;
-        min-width: 2rem !important;
+        height: 1.75rem !important;
+        min-height: 1.75rem !important;
+        width: 1.75rem !important;
+        min-width: 1.75rem !important;
         padding-left: 0 !important;
         padding-right: 0 !important;
         gap: 0 !important;
         justify-content: center !important;
       }
 
+      [data-wptt-lock-button] {
+  height: 1.75rem !important;
+  width: 1.75rem !important;
+  min-height: 1.75rem !important;
+  min-width: 1.75rem !important;
+  padding: 0 !important;
+}
+
       [data-wptt-back-divider] {
         width: 1px;
         height: 1.25rem;
         flex: 0 0 1px;
-        margin: 0 0.25rem;
-        background-color: currentColor;
+        margin: 0 0.125rem;
+        background-color:
+          var(--color-base-content, #000000);
         opacity: 0.2;
         pointer-events: none;
       }
@@ -4899,6 +4967,32 @@
     }
   }
 
+function ensureLockButtonPresentation(
+  toolbar,
+) {
+  if (!toolbar) {
+    return;
+  }
+
+  const lockButton =
+    toolbar.querySelector(
+      ':scope > button[title="Lock screen"], :scope > button[title="Unlock screen"]',
+    );
+
+  if (!lockButton) {
+    return;
+  }
+
+  if (
+    !lockButton.hasAttribute(
+      "data-wptt-lock-button",
+    )
+  ) {
+    lockButton.dataset
+      .wpttLockButton = "";
+  }
+}
+
   function ensureToolbarButtons() {
     const toolbar =
       findOverlayToolbar();
@@ -4907,13 +5001,17 @@
       return;
     }
 
+    ensureLockButtonPresentation(
+      toolbar,
+    );
+
     ensureBackButtonPresentation(
       toolbar,
     );
 
     /*
-     * Capture and replace Wplace's original Full Pixel icon before
-     * positioning the additional controls.
+     * Capture Wplace's original Full Pixel icon and use the same
+     * native button for transparent and finished preview states.
      */
     prepareNativeModeIcons(
       toolbar,
@@ -4942,11 +5040,6 @@
         PLUS_PREVIEW_BUTTON_SELECTOR,
       );
 
-    let fullPreviewButton =
-      toolbar.querySelector(
-        FULL_PREVIEW_BUTTON_SELECTOR,
-      );
-
     if (!highlightButton) {
       highlightButton =
         makeToggleButton();
@@ -4964,14 +5057,9 @@
         makePlusPreviewButton();
     }
 
-    if (!fullPreviewButton) {
-      fullPreviewButton =
-        makeFullPreviewButton();
-    }
-
     /*
-     * Added pixel modes follow Wplace's native modes. Finished preview
-     * stays furthest right, with plus preview directly before it.
+     * Plus preview follows Wplace's native display modes. Finished
+     * preview now shares Wplace's native Full Pixel control.
      */
     nativeButtons =
       getNativeModeButtons(
@@ -4993,16 +5081,6 @@
           plusPreviewButton,
         );
       }
-
-      if (
-        fullPreviewButton
-          .previousElementSibling !==
-        plusPreviewButton
-      ) {
-        plusPreviewButton.after(
-          fullPreviewButton,
-        );
-      }
     } else {
       const backButton =
         toolbar.querySelector(
@@ -5017,18 +5095,10 @@
           backButton ?? null,
         );
       }
-
-      if (
-        !fullPreviewButton.isConnected
-      ) {
-        plusPreviewButton.after(
-          fullPreviewButton,
-        );
-      }
     }
 
     /*
-     * Reapply icon replacements if Wplace rebuilt the toolbar.
+     * Reapply icon state if Wplace rebuilt the toolbar.
      */
     prepareNativeModeIcons(
       toolbar,
@@ -5155,7 +5225,7 @@
       }
 
       return {
-        version: "1.1.1",
+        version: "1.1.3",
 
         highlight:
           state.highlightMode ===
