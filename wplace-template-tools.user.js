@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      0.4.0
-// @description  Highlights template pixels that still need to be placed.
+// @version      0.5.0
+// @description  Adds visibility tools to Wplace's template overlay toolbar.
 // @author       VWBeetle
 // @match        https://wplace.live/*
 // @run-at       document-start
@@ -33,9 +33,6 @@
   const MASK_READY_UNIFORM_NAME =
     "u_wptt_mismatch_mask_ready";
 
-  const DEBUG_MODE_UNIFORM_NAME =
-    "u_wptt_debug_mode";
-
   const BUTTON_SELECTOR =
     "[data-wptt-magenta-toggle]";
 
@@ -57,30 +54,33 @@
   const STORAGE_KEY =
     "wplace-template-tools.preview-color";
 
-  /*
-   * Wplace's artwork PNGs.
-   */
   const ARTWORK_TILE_ZOOM = 11;
+
   const ARTWORK_TILE_COUNT =
     2 ** ARTWORK_TILE_ZOOM;
 
   const ARTWORK_TILE_ROOT =
     "https://backend.wplace.live/files/s0/tiles";
 
-  const COLOR_TOLERANCE = 2;
+  /*
+   * Periodic fallback in case artwork changes without a fetch mutation
+   * that we can observe.
+   */
+  const COMPARISON_REFRESH_MS = 15_000;
 
-  const COMPARISON_REFRESH_MS =
-    15_000;
+  /*
+   * After a successful mutating request to Wplace's backend, give the
+   * artwork tile a moment to update and then refresh the comparison.
+   */
+  const MUTATION_REFRESH_DELAY_MS = 1_000;
+
+  const COLOR_TOLERANCE = 2;
 
   const TILE_FETCH_CONCURRENCY = 6;
 
   const MAX_MASKS_PER_PROGRAM = 6;
 
-  const MAP_CAPTURE_TIMEOUT_MS =
-    3_000;
-
-  const DEBUG_MODE_NORMAL = 0;
-  const DEBUG_MODE_MATCHES = 1;
+  const MAP_CAPTURE_TIMEOUT_MS = 3_000;
 
   const COLOR_PRESETS = Object.freeze([
     {
@@ -131,7 +131,6 @@
   const state = {
     color: loadSavedColor(),
     enabled: false,
-    debugMode: DEBUG_MODE_NORMAL,
 
     map: null,
     mapPromise: null,
@@ -146,10 +145,21 @@
   globalThis[INSTALL_KEY] = state;
 
   const textureIds = new WeakMap();
-  const templatePixelCache = new WeakMap();
-  const artworkTileCache = new Map();
+
+  const templatePixelCache =
+    new WeakMap();
+
+  /*
+   * Cache decoded artwork PNGs by tile and refresh generation.
+   */
+  const artworkTileCache =
+    new Map();
 
   let nextTextureId = 1;
+
+  let artworkGeneration = 0;
+
+  let mutationRefreshTimer = 0;
 
   // ===========================================================================
   // Settings
@@ -185,7 +195,7 @@
   }
 
   // ===========================================================================
-  // Capture the MapLibre map
+  // MapLibre capture
   // ===========================================================================
 
   function looksLikeMapInstance(instance) {
@@ -354,15 +364,12 @@
       Function.prototype.apply =
         applyWrapper;
 
-      timeout = setTimeout(
-        () => finish(null),
-        timeoutMs,
-      );
+      timeout =
+        setTimeout(
+          () => finish(null),
+          timeoutMs,
+        );
 
-      /*
-       * Make MapLibre do some work so its instance is likely to
-       * pass through call/apply while our temporary hooks are active.
-       */
       globalThis.dispatchEvent(
         new Event("resize"),
       );
@@ -372,7 +379,9 @@
   async function getMapInstance() {
     if (
       state.map &&
-      looksLikeMapInstance(state.map)
+      looksLikeMapInstance(
+        state.map,
+      )
     ) {
       return state.map;
     }
@@ -392,10 +401,6 @@
           return null;
         }
 
-        /*
-         * Try a few times. The first resize may occur while Wplace
-         * is still finishing map setup.
-         */
         for (
           let attempt = 0;
           attempt < 3;
@@ -409,10 +414,6 @@
           if (instance) {
             state.map = instance;
 
-            console.info(
-              "[Wplace Template Tools] MapLibre map captured.",
-            );
-
             return instance;
           }
 
@@ -425,9 +426,6 @@
     const result =
       await state.mapPromise;
 
-    /*
-     * Allow a later retry if capture failed.
-     */
     if (!result) {
       state.mapPromise = null;
     }
@@ -435,16 +433,16 @@
     return result;
   }
 
-  function delay(ms) {
+  function delay(milliseconds) {
     return new Promise(
       (resolve) =>
-        setTimeout(resolve, ms),
+        setTimeout(
+          resolve,
+          milliseconds,
+        ),
     );
   }
 
-  /*
-   * Start trying immediately, but don't block script startup.
-   */
   void getMapInstance();
 
   // ===========================================================================
@@ -511,7 +509,6 @@
           `uniform vec3 ${COLOR_UNIFORM_NAME};`,
           `uniform sampler2D ${MASK_UNIFORM_NAME};`,
           `uniform bool ${MASK_READY_UNIFORM_NAME};`,
-          `uniform int ${DEBUG_MODE_UNIFORM_NAME};`,
         ].join("\n"),
       );
 
@@ -523,16 +520,8 @@
         `    ${MASK_UNIFORM_NAME},`,
         `    (source_pixel + 0.5) / u_source_size`,
         `  ).r;`,
-        ``,
-        `  if (${DEBUG_MODE_UNIFORM_NAME} == ${DEBUG_MODE_MATCHES}) {`,
-        `    if (wptt_mismatch > 0.5) {`,
-        `      discard;`,
-        `    }`,
-        `    color.rgb = vec3(0.0, 1.0, 0.25);`,
-        `  } else {`,
-        `    if (wptt_mismatch > 0.5) {`,
-        `      color.rgb = ${COLOR_UNIFORM_NAME};`,
-        `    }`,
+        `  if (wptt_mismatch > 0.5) {`,
+        `    color.rgb = ${COLOR_UNIFORM_NAME};`,
         `  }`,
         `}`,
         colorNeedle,
@@ -541,7 +530,7 @@
   }
 
   // ===========================================================================
-  // Overlay program setup
+  // Overlay program tracking
   // ===========================================================================
 
   function trackOverlayProgram(
@@ -599,13 +588,6 @@
           gl,
           program,
           MASK_READY_UNIFORM_NAME,
-        ),
-
-      debugMode:
-        native.getUniformLocation.call(
-          gl,
-          program,
-          DEBUG_MODE_UNIFORM_NAME,
         ),
 
       texture:
@@ -671,8 +653,6 @@
         null ||
       locations.mask === null ||
       locations.maskReady ===
-        null ||
-      locations.debugMode ===
         null ||
       locations.matrix === null ||
       locations.worldSize === null
@@ -760,12 +740,6 @@
         state.color.rgb[2],
       );
 
-      native.uniform1i.call(
-        gl,
-        locations.debugMode,
-        state.debugMode,
-      );
-
       native.useProgram.call(
         gl,
         previousProgram,
@@ -805,7 +779,7 @@
   }
 
   // ===========================================================================
-  // Read current overlay state
+  // Current template draw
   // ===========================================================================
 
   function getTextureId(texture) {
@@ -1053,10 +1027,10 @@
         getTextureId(texture);
 
       /*
-       * Matrix is intentionally NOT part of this key.
+       * Camera matrix is intentionally omitted.
        *
-       * The map camera changes the matrix while the template remains
-       * geographically fixed. We refresh periodically anyway.
+       * These values identify the template itself and its geographic
+       * placement. The camera may move without changing either.
        */
       const key =
         [
@@ -1092,18 +1066,13 @@
         bottomRight,
         bottomLeft,
       };
-    } catch (error) {
-      console.debug(
-        "[Wplace Template Tools] Could not inspect template draw.",
-        error,
-      );
-
+    } catch {
       return null;
     }
   }
 
   // ===========================================================================
-  // Read template texture
+  // Template texture readback
   // ===========================================================================
 
   function readTemplatePixels(
@@ -1185,12 +1154,6 @@
             4,
         );
 
-      /*
-       * Keep the raw row order.
-       *
-       * source_pixel.y = 0 in Wplace's fragment shader samples texture
-       * row 0, and this readback gives us that same texture-row order.
-       */
       native.readPixels.call(
         gl,
         0,
@@ -1232,7 +1195,7 @@
   }
 
   // ===========================================================================
-  // Template pixel -> screen -> longitude/latitude
+  // Template coordinates
   // ===========================================================================
 
   function lerp(a, b, t) {
@@ -1298,15 +1261,6 @@
     ];
   }
 
-  /*
-   * GLSL:
-   *
-   * gl_Position =
-   *   u_matrix *
-   *   vec4(position * u_world_size, 0.0, 1.0);
-   *
-   * WebGL matrices are column-major.
-   */
   function transformLocalToClip(
     drawInfo,
     localX,
@@ -1323,31 +1277,22 @@
       localY *
       drawInfo.worldSize;
 
-    const clipX =
-      m[0] * x +
-      m[4] * y +
-      m[12];
-
-    const clipY =
-      m[1] * x +
-      m[5] * y +
-      m[13];
-
-    const clipZ =
-      m[2] * x +
-      m[6] * y +
-      m[14];
-
-    const clipW =
-      m[3] * x +
-      m[7] * y +
-      m[15];
-
     return [
-      clipX,
-      clipY,
-      clipZ,
-      clipW,
+      m[0] * x +
+        m[4] * y +
+        m[12],
+
+      m[1] * x +
+        m[5] * y +
+        m[13],
+
+      m[2] * x +
+        m[6] * y +
+        m[14],
+
+      m[3] * x +
+        m[7] * y +
+        m[15],
     ];
   }
 
@@ -1401,30 +1346,15 @@
       return null;
     }
 
-    const viewportX =
-      Number(viewport[0]);
-
-    const viewportY =
-      Number(viewport[1]);
-
-    const viewportWidth =
-      Number(viewport[2]);
-
-    const viewportHeight =
-      Number(viewport[3]);
-
     const framebufferX =
-      viewportX +
+      Number(viewport[0]) +
       ((ndcX + 1) / 2) *
-        viewportWidth;
+        Number(viewport[2]);
 
-    /*
-     * WebGL framebuffer Y grows upward.
-     */
     const framebufferY =
-      viewportY +
+      Number(viewport[1]) +
       ((ndcY + 1) / 2) *
-        viewportHeight;
+        Number(viewport[3]);
 
     const canvas =
       gl.canvas;
@@ -1435,49 +1365,35 @@
     const drawingHeight =
       gl.drawingBufferHeight;
 
+    const cssWidth =
+      canvas?.clientWidth ?? 0;
+
+    const cssHeight =
+      canvas?.clientHeight ?? 0;
+
     if (
       !canvas ||
       drawingWidth <= 0 ||
-      drawingHeight <= 0
-    ) {
-      return null;
-    }
-
-    const cssWidth =
-      canvas.clientWidth;
-
-    const cssHeight =
-      canvas.clientHeight;
-
-    if (
+      drawingHeight <= 0 ||
       cssWidth <= 0 ||
       cssHeight <= 0
     ) {
       return null;
     }
 
-    /*
-     * MapLibre's unproject() expects CSS pixels relative to the
-     * map canvas/container, with Y=0 at the top.
-     */
-    const screenX =
+    return [
       (
         framebufferX /
         drawingWidth
       ) *
-      cssWidth;
+        cssWidth,
 
-    const screenY =
       (
         1 -
         framebufferY /
           drawingHeight
       ) *
-      cssHeight;
-
-    return [
-      screenX,
-      screenY,
+        cssHeight,
     ];
   }
 
@@ -1536,13 +1452,11 @@
 
       lat:
         lngLat.lat,
-
-      screen,
     };
   }
 
   // ===========================================================================
-  // Longitude/latitude -> Wplace tile
+  // Geographic coordinate -> artwork tile
   // ===========================================================================
 
   function longitudeToTileX(
@@ -1659,43 +1573,135 @@
   }
 
   // ===========================================================================
+  // Geographic lookup cache
+  // ===========================================================================
+
+  async function buildLookupData(
+    record,
+    drawInfo,
+  ) {
+    const map =
+      await getMapInstance();
+
+    if (!map) {
+      throw new Error(
+        "MapLibre map instance is not available",
+      );
+    }
+
+    const templatePixels =
+      readTemplatePixels(
+        record,
+        drawInfo,
+      );
+
+    const lookups =
+      new Array(
+        drawInfo.width *
+          drawInfo.height,
+      );
+
+    const requiredTiles =
+      new Map();
+
+    for (
+      let y = 0;
+      y < drawInfo.height;
+      y += 1
+    ) {
+      for (
+        let x = 0;
+        x < drawInfo.width;
+        x += 1
+      ) {
+        const pixelIndex =
+          y *
+            drawInfo.width +
+          x;
+
+        const offset =
+          pixelIndex * 4;
+
+        if (
+          templatePixels[
+            offset + 3
+          ] < 1
+        ) {
+          continue;
+        }
+
+        const geographic =
+          templatePixelToLngLat(
+            record,
+            drawInfo,
+            map,
+            x,
+            y,
+          );
+
+        if (!geographic) {
+          continue;
+        }
+
+        const address =
+          lngLatToArtworkTile(
+            geographic.lng,
+            geographic.lat,
+          );
+
+        if (!address) {
+          continue;
+        }
+
+        lookups[pixelIndex] =
+          address;
+
+        requiredTiles.set(
+          address.key,
+          {
+            x:
+              address.tileX,
+
+            y:
+              address.tileY,
+          },
+        );
+      }
+    }
+
+    return {
+      templatePixels,
+      lookups,
+
+      requiredTiles: [
+        ...requiredTiles.entries(),
+      ],
+    };
+  }
+
+  // ===========================================================================
   // Artwork PNG loading
   // ===========================================================================
 
   async function loadArtworkTile(
     tileX,
     tileY,
-    forceRefresh,
   ) {
-    const key =
-      `${tileX}/${tileY}`;
-
-    const now =
-      Date.now();
+    const cacheKey =
+      `${artworkGeneration}:${tileX}/${tileY}`;
 
     const cached =
       artworkTileCache.get(
-        key,
+        cacheKey,
       );
 
-    if (
-      !forceRefresh &&
-      cached &&
-      now - cached.time <
-        COMPARISON_REFRESH_MS
-    ) {
-      return cached.promise;
+    if (cached) {
+      return cached;
     }
-
-    const refreshBucket =
-      Math.floor(
-        now /
-          COMPARISON_REFRESH_MS,
-      );
 
     const promise =
       fetch(
-        `${ARTWORK_TILE_ROOT}/${tileX}/${tileY}.png?wptt=${refreshBucket}`,
+        `${ARTWORK_TILE_ROOT}/${tileX}/${tileY}.png?wptt=${artworkGeneration}`,
         {
           cache: "no-store",
         },
@@ -1727,7 +1733,7 @@
         .catch(
           (error) => {
             console.warn(
-              `[Wplace Template Tools] Could not load artwork tile ${key}.`,
+              `[Wplace Template Tools] Could not load artwork tile ${tileX}/${tileY}.`,
               error,
             );
 
@@ -1736,11 +1742,8 @@
         );
 
     artworkTileCache.set(
-      key,
-      {
-        time: now,
-        promise,
-      },
+      cacheKey,
+      promise,
     );
 
     return promise;
@@ -1854,116 +1857,33 @@
   }
 
   // ===========================================================================
-  // Comparison
+  // Mismatch comparison
   // ===========================================================================
 
   async function buildMismatchMask(
     record,
     drawInfo,
-    forceTileRefresh,
+    entry,
   ) {
-    const map =
-      await getMapInstance();
-
-    if (!map) {
-      throw new Error(
-        "MapLibre map instance is not available",
-      );
-    }
-
-    const templatePixels =
-      readTemplatePixels(
-        record,
-        drawInfo,
-      );
-
-    /*
-     * Save the geographic lookup for each opaque template pixel so we
-     * only perform matrix transformation + unproject once per build.
-     */
-    const lookups =
-      new Array(
-        drawInfo.width *
-          drawInfo.height,
-      );
-
-    const requiredTiles =
-      new Map();
-
-    for (
-      let y = 0;
-      y < drawInfo.height;
-      y += 1
-    ) {
-      for (
-        let x = 0;
-        x < drawInfo.width;
-        x += 1
-      ) {
-        const pixelIndex =
-          y *
-            drawInfo.width +
-          x;
-
-        const offset =
-          pixelIndex * 4;
-
-        if (
-          templatePixels[
-            offset + 3
-          ] < 1
-        ) {
-          continue;
-        }
-
-        const geographic =
-          templatePixelToLngLat(
-            record,
-            drawInfo,
-            map,
-            x,
-            y,
-          );
-
-        if (!geographic) {
-          continue;
-        }
-
-        const address =
-          lngLatToArtworkTile(
-            geographic.lng,
-            geographic.lat,
-          );
-
-        if (!address) {
-          continue;
-        }
-
-        lookups[pixelIndex] = {
-          geographic,
-          address,
-        };
-
-        requiredTiles.set(
-          address.key,
-          {
-            x:
-              address.tileX,
-
-            y:
-              address.tileY,
-          },
+    if (!entry.lookupData) {
+      entry.lookupData =
+        await buildLookupData(
+          record,
+          drawInfo,
         );
-      }
     }
+
+    const {
+      templatePixels,
+      lookups,
+      requiredTiles,
+    } = entry.lookupData;
 
     const loadedTiles =
       new Map();
 
     await mapWithConcurrency(
-      [
-        ...requiredTiles.entries(),
-      ],
+      requiredTiles,
       TILE_FETCH_CONCURRENCY,
       async ([
         key,
@@ -1973,7 +1893,6 @@
           await loadArtworkTile(
             tile.x,
             tile.y,
-            forceTileRefresh,
           );
 
         loadedTiles.set(
@@ -1983,20 +1902,12 @@
       },
     );
 
-    /*
-     * Mask red:
-     *
-     * 255 = unfinished / wrong
-     *   0 = already correct
-     */
     const mask =
       new Uint8Array(
         drawInfo.width *
           drawInfo.height *
           4,
       );
-
-    const matches = [];
 
     let comparedCount = 0;
     let mismatchCount = 0;
@@ -2023,46 +1934,34 @@
           offset + 3
         ] = 255;
 
-        const templateAlpha =
+        if (
           templatePixels[
             offset + 3
-          ];
-
-        if (
-          templateAlpha < 1
+          ] < 1
         ) {
           continue;
         }
 
         comparedCount += 1;
 
-        const lookup =
+        const address =
           lookups[pixelIndex];
 
-        if (!lookup) {
+        if (!address) {
           mask[offset] = 255;
           mismatchCount += 1;
           continue;
         }
-
-        const {
-          address,
-          geographic,
-        } = lookup;
 
         const tile =
           loadedTiles.get(
             address.key,
           );
 
-        let matchesArtwork = false;
-        let actualColor = null;
-
-        let tilePixelX = null;
-        let tilePixelY = null;
+        let matches = false;
 
         if (tile) {
-          tilePixelX =
+          const tilePixelX =
             clampInteger(
               Math.floor(
                 address.fractionalX *
@@ -2072,7 +1971,7 @@
               tile.width - 1,
             );
 
-          tilePixelY =
+          const tilePixelY =
             clampInteger(
               Math.floor(
                 address.fractionalY *
@@ -2090,27 +1989,12 @@
             ) *
             4;
 
-          const actualAlpha =
+          if (
             tile.data[
               tileOffset + 3
-            ];
-
-          if (
-            actualAlpha > 0
+            ] > 0
           ) {
-            actualColor = [
-              tile.data[
-                tileOffset
-              ],
-              tile.data[
-                tileOffset + 1
-              ],
-              tile.data[
-                tileOffset + 2
-              ],
-            ];
-
-            matchesArtwork =
+            matches =
               colorMatches(
                 templatePixels[
                   offset
@@ -2122,57 +2006,20 @@
                   offset + 2
                 ],
 
-                actualColor[0],
-                actualColor[1],
-                actualColor[2],
+                tile.data[
+                  tileOffset
+                ],
+                tile.data[
+                  tileOffset + 1
+                ],
+                tile.data[
+                  tileOffset + 2
+                ],
               );
           }
         }
 
-        if (matchesArtwork) {
-          matches.push({
-            x,
-            y,
-
-            template: [
-              templatePixels[
-                offset
-              ],
-              templatePixels[
-                offset + 1
-              ],
-              templatePixels[
-                offset + 2
-              ],
-            ],
-
-            artwork:
-              actualColor,
-
-            longitude:
-              geographic.lng,
-
-            latitude:
-              geographic.lat,
-
-            screen:
-              geographic.screen,
-
-            tile: {
-              x:
-                address.tileX,
-
-              y:
-                address.tileY,
-
-              pixelX:
-                tilePixelX,
-
-              pixelY:
-                tilePixelY,
-            },
-          });
-        } else {
+        if (!matches) {
           mask[offset] = 255;
           mismatchCount += 1;
         }
@@ -2181,7 +2028,6 @@
 
     return {
       mask,
-      matches,
       comparedCount,
       mismatchCount,
     };
@@ -2244,26 +2090,19 @@
       }
     }
 
-    const workers = [];
-
     const count =
       Math.min(
         concurrency,
         values.length,
       );
 
-    for (
-      let i = 0;
-      i < count;
-      i += 1
-    ) {
-      workers.push(
-        runWorker(),
-      );
-    }
-
     await Promise.all(
-      workers,
+      Array.from(
+        {
+          length: count,
+        },
+        () => runWorker(),
+      ),
     );
   }
 
@@ -2347,12 +2186,6 @@
         gl.CLAMP_TO_EDGE,
       );
 
-      /*
-       * No vertical flip here.
-       *
-       * The mask's row order matches source_pixel.y in the template
-       * fragment shader.
-       */
       native.texImage2D.call(
         gl,
         gl.TEXTURE_2D,
@@ -2380,7 +2213,7 @@
   }
 
   // ===========================================================================
-  // Mask cache
+  // Comparison cache
   // ===========================================================================
 
   function getMaskEntry(
@@ -2400,17 +2233,17 @@
         texture:
           null,
 
+        lookupData:
+          null,
+
         ready:
           false,
 
         building:
           false,
 
-        builtAt:
-          0,
-
-        matches:
-          [],
+        builtGeneration:
+          -1,
 
         comparedCount:
           0,
@@ -2449,18 +2282,12 @@
 
     const candidates = [
       ...record.maskCache.values(),
-    ]
-      .filter(
-        (entry) =>
-          entry.key !==
-            preserveKey &&
-          !entry.building,
-      )
-      .sort(
-        (a, b) =>
-          a.builtAt -
-          b.builtAt,
-      );
+    ].filter(
+      (entry) =>
+        entry.key !==
+          preserveKey &&
+        !entry.building,
+    );
 
     while (
       record.maskCache.size >
@@ -2492,17 +2319,13 @@
     drawInfo,
     entry,
   ) {
-    if (entry.building) {
-      return;
-    }
-
-    const now =
-      Date.now();
-
     if (
-      entry.ready &&
-      now - entry.builtAt <
-        COMPARISON_REFRESH_MS
+      entry.building ||
+      (
+        entry.ready &&
+        entry.builtGeneration ===
+          artworkGeneration
+      )
     ) {
       return;
     }
@@ -2512,14 +2335,9 @@
     const token =
       ++entry.buildToken;
 
-    const refreshing =
-      entry.ready;
-
     /*
-     * Capture the current matrix immediately.
-     *
-     * A later map movement can change the program's uniforms while
-     * asynchronous tile requests are running.
+     * Geographic lookup uses the current camera matrix once, when the
+     * template is first encountered. Copy it before async work begins.
      */
     const buildDrawInfo = {
       ...drawInfo,
@@ -2548,11 +2366,14 @@
     queueMicrotask(
       async () => {
         try {
+          const generation =
+            artworkGeneration;
+
           const result =
             await buildMismatchMask(
               record,
               buildDrawInfo,
-              refreshing,
+              entry,
             );
 
           if (
@@ -2570,11 +2391,9 @@
           );
 
           entry.ready = true;
-          entry.builtAt =
-            Date.now();
 
-          entry.matches =
-            result.matches;
+          entry.builtGeneration =
+            generation;
 
           entry.comparedCount =
             result.comparedCount;
@@ -2582,14 +2401,10 @@
           entry.mismatchCount =
             result.mismatchCount;
 
-          console.info(
-            `[Wplace Template Tools] Comparison ready: ${result.mismatchCount} of ${result.comparedCount} template pixels still need work; ${result.matches.length} match.`,
-          );
-
           requestMapRepaint();
         } catch (error) {
           console.warn(
-            "[Wplace Template Tools] Could not build comparison.",
+            "[Wplace Template Tools] Could not update unfinished-pixel comparison.",
             error,
           );
         } finally {
@@ -2606,7 +2421,7 @@
   }
 
   // ===========================================================================
-  // Bind comparison texture
+  // Bind comparison mask
   // ===========================================================================
 
   function bindComparisonForDraw(
@@ -3013,13 +2828,134 @@
   );
 
   // ===========================================================================
-  // State changes
+  // Refresh handling
+  // ===========================================================================
+
+  function refreshComparison() {
+    artworkGeneration += 1;
+
+    /*
+     * Old generations are never used again.
+     */
+    artworkTileCache.clear();
+
+    requestMapRepaint();
+  }
+
+  function scheduleMutationRefresh() {
+    clearTimeout(
+      mutationRefreshTimer,
+    );
+
+    mutationRefreshTimer =
+      setTimeout(
+        () => {
+          mutationRefreshTimer = 0;
+
+          if (state.enabled) {
+            refreshComparison();
+          }
+        },
+        MUTATION_REFRESH_DELAY_MS,
+      );
+  }
+
+  /*
+   * Observe successful Wplace backend mutations without changing
+   * the request or response.
+   */
+  function installFetchMutationWatcher() {
+    const nativeFetch =
+      globalThis.fetch;
+
+    if (
+      typeof nativeFetch !==
+        "function" ||
+      nativeFetch.__wpttWatched
+    ) {
+      return;
+    }
+
+    async function watchedFetch(
+      input,
+      init,
+    ) {
+      const response =
+        await nativeFetch.call(
+          this,
+          input,
+          init,
+        );
+
+      try {
+        const request =
+          input instanceof Request
+            ? input
+            : null;
+
+        const url = new URL(
+          request?.url ??
+            String(input),
+          location.href,
+        );
+
+        const method =
+          (
+            init?.method ??
+            request?.method ??
+            "GET"
+          ).toUpperCase();
+
+        if (
+          response.ok &&
+          url.hostname ===
+            "backend.wplace.live" &&
+          (
+            method === "POST" ||
+            method === "PUT" ||
+            method === "PATCH" ||
+            method === "DELETE"
+          )
+        ) {
+          scheduleMutationRefresh();
+        }
+      } catch {
+        // Never allow refresh detection to interfere with Wplace.
+      }
+
+      return response;
+    }
+
+    Object.defineProperty(
+      watchedFetch,
+      "__wpttWatched",
+      {
+        value: true,
+      },
+    );
+
+    globalThis.fetch =
+      watchedFetch;
+  }
+
+  installFetchMutationWatcher();
+
+  setInterval(
+    () => {
+      if (state.enabled) {
+        refreshComparison();
+      }
+    },
+    COMPARISON_REFRESH_MS,
+  );
+
+  // ===========================================================================
+  // UI state
   // ===========================================================================
 
   function setEnabled(enabled) {
     if (
-      state.enabled ===
-      enabled
+      state.enabled === enabled
     ) {
       return;
     }
@@ -3032,8 +2968,13 @@
     );
 
     if (enabled) {
-      markComparisonsStale();
       void getMapInstance();
+
+      /*
+       * Force fresh artwork rather than displaying an old mask from
+       * a previous activation.
+       */
+      refreshComparison();
     }
 
     updateButtons();
@@ -3051,7 +2992,8 @@
       return;
     }
 
-    state.color = color;
+    state.color =
+      color;
 
     saveColor(color);
 
@@ -3064,73 +3006,18 @@
     requestMapRepaint();
   }
 
-  function setDebugMode(mode) {
-    if (
-      mode === "normal" ||
-      mode === 0
-    ) {
-      state.debugMode =
-        DEBUG_MODE_NORMAL;
-    } else if (
-      mode === "matches" ||
-      mode === 1
-    ) {
-      state.debugMode =
-        DEBUG_MODE_MATCHES;
-    } else {
-      throw new Error(
-        'Debug mode must be "normal" or "matches".',
-      );
-    }
-
-    state.records.forEach(
-      setProgramUniform,
-    );
-
-    requestMapRepaint();
-
-    console.info(
-      `[Wplace Template Tools] Debug mode: ${
-        state.debugMode ===
-        DEBUG_MODE_MATCHES
-          ? "matches"
-          : "normal"
-      }`,
-    );
-  }
-
-  function markComparisonsStale() {
-    for (
-      const record of
-      state.records
-    ) {
-      for (
-        const entry of
-        record.maskCache.values()
-      ) {
-        entry.builtAt = 0;
-      }
-    }
-  }
-
-  function refreshComparison() {
-    artworkTileCache.clear();
-
-    markComparisonsStale();
-
-    requestMapRepaint();
-  }
-
   function requestMapRepaint() {
-    requestAnimationFrame(() => {
-      globalThis.dispatchEvent(
-        new Event("resize"),
-      );
-    });
+    requestAnimationFrame(
+      () => {
+        globalThis.dispatchEvent(
+          new Event("resize"),
+        );
+      },
+    );
   }
 
   // ===========================================================================
-  // UI
+  // Toolbar button
   // ===========================================================================
 
   function updateButtons() {
@@ -3155,8 +3042,7 @@
             : `Highlight unfinished template pixels in ${state.color.label.toLowerCase()}`;
 
         if (
-          button.title !==
-          title
+          button.title !== title
         ) {
           button.title =
             title;
@@ -3209,14 +3095,19 @@
 
     button.addEventListener(
       "click",
-      () =>
+      () => {
         setEnabled(
           !state.enabled,
-        ),
+        );
+      },
     );
 
     return button;
   }
+
+  // ===========================================================================
+  // Color picker
+  // ===========================================================================
 
   function updateColorPickers() {
     document
@@ -3266,7 +3157,8 @@
       )
       .forEach((label) => {
         const text =
-          `${state.color.label} · ${state.color.hex.toUpperCase()}`;
+          `${state.color.label} · ` +
+          state.color.hex.toUpperCase();
 
         const textNode =
           label.firstChild;
@@ -3327,7 +3219,7 @@
       "text-sm font-medium";
 
     title.textContent =
-      "Unfinished pixel color";
+      "Highlight color";
 
     const description =
       document.createElement(
@@ -3338,7 +3230,7 @@
       "text-base-content/50 text-xs";
 
     description.textContent =
-      "Highlights template pixels that differ from the current artwork";
+      "Used for template pixels that still need work";
 
     copy.append(
       title,
@@ -3429,10 +3321,11 @@
 
       button.addEventListener(
         "click",
-        () =>
+        () => {
           setColor(
             color.id,
-          ),
+          );
+        },
       );
 
       swatches.append(
@@ -3467,10 +3360,6 @@
       controls,
     );
 
-    /*
-     * Initialize state before insertion so the document observer
-     * doesn't get into a feedback loop.
-     */
     for (
       const button of
       swatches.querySelectorAll(
@@ -3659,8 +3548,7 @@
   // DOM observer
   // ===========================================================================
 
-  let ensureScheduled =
-    false;
+  let ensureScheduled = false;
 
   const uiObserver =
     new MutationObserver(() => {
@@ -3687,170 +3575,46 @@
   ensureUi();
 
   // ===========================================================================
-  // Periodic comparison refresh
+  // Small public API
   // ===========================================================================
-
-  setInterval(() => {
-    if (!state.enabled) {
-      return;
-    }
-
-    markComparisonsStale();
-
-    requestMapRepaint();
-  }, COMPARISON_REFRESH_MS);
-
-  // ===========================================================================
-  // Diagnostics
-  // ===========================================================================
-
-  function getLatestEntry() {
-    let latest = null;
-
-    for (
-      const record of
-      state.records
-    ) {
-      for (
-        const entry of
-        record.maskCache.values()
-      ) {
-        if (!entry.ready) {
-          continue;
-        }
-
-        if (
-          !latest ||
-          entry.builtAt >
-            latest.builtAt
-        ) {
-          latest = entry;
-        }
-      }
-    }
-
-    return latest;
-  }
-
-  function getMatches() {
-    const latest =
-      getLatestEntry();
-
-    return latest
-      ? latest.matches
-      : [];
-  }
-
-  function logMatches() {
-    const matches =
-      getMatches();
-
-    console.table(
-      matches.map(
-        (match) => ({
-          x:
-            match.x,
-
-          y:
-            match.y,
-
-          template:
-            match.template.join(
-              ", ",
-            ),
-
-          artwork:
-            match.artwork?.join(
-              ", ",
-            ) ?? "",
-
-          lng:
-            match.longitude,
-
-          lat:
-            match.latitude,
-
-          tile:
-            match.tile
-              ? `${match.tile.x}/${match.tile.y}`
-              : "",
-
-          tilePixel:
-            match.tile
-              ? `${match.tile.pixelX},${match.tile.pixelY}`
-              : "",
-        }),
-      ),
-    );
-
-    return matches;
-  }
 
   globalThis.wplaceTemplateTools = {
-    refreshComparison,
-    setDebugMode,
-    getMatches,
-    logMatches,
-
-    async getMapStatus() {
-      const map =
-        await getMapInstance();
-
-      return map
-        ? {
-            captured: true,
-            zoom:
-              map.getZoom(),
-
-            center:
-              map.getCenter(),
-          }
-        : {
-            captured: false,
-          };
-    },
+    refresh:
+      refreshComparison,
 
     getStatus() {
-      const latest =
-        getLatestEntry();
+      let compared = 0;
+      let mismatches = 0;
+
+      for (
+        const record of
+        state.records
+      ) {
+        for (
+          const entry of
+          record.maskCache.values()
+        ) {
+          if (!entry.ready) {
+            continue;
+          }
+
+          compared +=
+            entry.comparedCount;
+
+          mismatches +=
+            entry.mismatchCount;
+        }
+      }
 
       return {
-        version: "0.4.0",
-
-        enabled:
-          state.enabled,
-
+        version: "0.5.0",
+        enabled: state.enabled,
+        color: state.color.id,
         mapCaptured:
           Boolean(state.map),
-
-        debugMode:
-          state.debugMode ===
-          DEBUG_MODE_MATCHES
-            ? "matches"
-            : "normal",
-
-        color:
-          state.color.id,
-
-        compared:
-          latest?.comparedCount ??
-          0,
-
-        mismatches:
-          latest?.mismatchCount ??
-          0,
-
-        matches:
-          latest?.matches.length ??
-          0,
-
-        artworkTileZoom:
-          ARTWORK_TILE_ZOOM,
+        compared,
+        mismatches,
       };
     },
   };
-
-  console.info(
-    "[Wplace Template Tools] 0.4.0 loaded.",
-  );
 })();
