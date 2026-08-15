@@ -1,10 +1,13 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      0.6.1
-// @description  Adds visibility tools to Wplace's template overlay toolbar.
+// @version      1.0.0
+// @license      MIT
+// @description  Extra tools for use with Wplace overlays
+// @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
+// @updateURL    https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
 // @author       VWBeetle
-// @match        https://wplace.live/*
+// @match        *://*.wplace.live/*
 // @run-at       document-start
 // @sandbox      raw
 // @grant        none
