@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      0.6.0
+// @version      0.6.1
 // @description  Adds visibility tools to Wplace's template overlay toolbar.
 // @author       VWBeetle
 // @match        https://wplace.live/*
@@ -84,14 +84,9 @@
   const MAP_CAPTURE_TIMEOUT_MS = 3_000;
 
   /*
-   * Subtle brightness pulse:
-   *
-   * 94% -> 100% -> 94%
-   *
-   * The map only needs to repaint about 30 times per second for this
-   * to look smooth.
+   * Pulse appearance.
    */
-  const PULSE_MIN_BRIGHTNESS = 0.35;
+  const PULSE_MIN_BRIGHTNESS = 0.4;
   const PULSE_MAX_BRIGHTNESS = 1.0;
   const PULSE_PERIOD_MS = 3_000;
   const PULSE_FRAME_INTERVAL_MS = 1_000 / 30;
@@ -150,9 +145,6 @@
     color: loadSavedColor(),
     pulseEnabled: loadPulseEnabled(),
 
-    /*
-     * Active highlight state is intentionally NOT persisted.
-     */
     highlightMode: HIGHLIGHT_OFF,
 
     pulseBrightness: 1,
@@ -226,9 +218,6 @@
           PULSE_STORAGE_KEY,
         );
 
-      /*
-       * Default to enabled.
-       */
       return saved !== "false";
     } catch {
       return true;
@@ -3006,11 +2995,6 @@
         lastPulseFrameTime =
           time;
 
-        /*
-         * cosine starts at full brightness:
-         *
-         * 1 -> 0 -> 1
-         */
         const phase =
           (
             time %
@@ -3216,7 +3200,8 @@
 
   function setHighlightMode(mode) {
     if (
-      state.highlightMode === mode
+      state.highlightMode ===
+      mode
     ) {
       return;
     }
@@ -3276,6 +3261,7 @@
 
     updateButtons();
     updateSettingsUi();
+
     requestMapRepaint();
   }
 
@@ -3297,11 +3283,6 @@
       enabled,
     );
 
-    /*
-     * If Pulse is currently active and the user removes it from the
-     * cycle, fall back to Solid rather than abruptly turning the whole
-     * highlight feature off.
-     */
     if (
       !enabled &&
       state.highlightMode ===
@@ -3324,10 +3305,6 @@
   }
 
   function requestMapRepaint() {
-    /*
-     * MapLibre provides a much lighter repaint mechanism than forcing
-     * a window resize. Use it when available.
-     */
     if (
       state.map &&
       typeof state.map
@@ -3356,9 +3333,7 @@
       state.highlightMode ===
       HIGHLIGHT_OFF
     ) {
-      return state.pulseEnabled
-        ? `Highlight unfinished pixels in ${state.color.label.toLowerCase()}`
-        : `Highlight unfinished pixels in ${state.color.label.toLowerCase()}`;
+      return `Highlight unfinished pixels in ${state.color.label.toLowerCase()}`;
     }
 
     if (
@@ -3379,21 +3354,26 @@
         BUTTON_SELECTOR,
       )
       .forEach((button) => {
-        const active =
-          state.highlightMode !==
-          HIGHLIGHT_OFF;
+        const solid =
+          state.highlightMode ===
+          HIGHLIGHT_SOLID;
 
         const pulsing =
           state.highlightMode ===
           HIGHLIGHT_PULSE;
 
+        /*
+         * Solid uses Wplace's normal active appearance.
+         *
+         * Pulse uses our deliberately inverted appearance instead.
+         */
         button.classList.toggle(
           "btn-active",
-          active,
+          solid,
         );
 
         button.classList.toggle(
-          "wptt-toolbar-pulsing",
+          "wptt-pulse-state",
           pulsing,
         );
 
@@ -3401,14 +3381,16 @@
           state.highlightMode ===
           HIGHLIGHT_OFF
             ? "off"
-            : state.highlightMode ===
-                HIGHLIGHT_SOLID
+            : solid
               ? "solid"
               : "pulse";
 
         button.setAttribute(
           "aria-pressed",
-          String(active),
+          String(
+            state.highlightMode !==
+              HIGHLIGHT_OFF,
+          ),
         );
 
         const title =
@@ -3455,7 +3437,6 @@
 
     button.innerHTML = `
       <svg
-        data-wptt-lightning-icon
         xmlns="http://www.w3.org/2000/svg"
         viewBox="0 0 24 24"
         fill="currentColor"
@@ -3492,27 +3473,26 @@
       .wpttToolbarStyles = "";
 
     style.textContent = `
-      @keyframes wptt-toolbar-pulse {
-        0%, 100% {
-          opacity: 1;
-          transform: scale(1);
-        }
-
-        50% {
-          opacity: 0.72;
-          transform: scale(0.88);
-        }
+      /*
+       * Pulse is the second active state:
+       * visually invert the normal toolbar appearance.
+       */
+      .wptt-pulse-state {
+        background-color: #ffffff !important;
+        border-color: #ffffff !important;
+        color: #1f1f1f !important;
       }
 
-      .wptt-toolbar-pulsing [data-wptt-lightning-icon] {
-        animation: wptt-toolbar-pulse 2s ease-in-out infinite;
-        transform-origin: center;
+      .wptt-pulse-state:hover {
+        background-color: #f2f2f2 !important;
+        border-color: #f2f2f2 !important;
+        color: #1f1f1f !important;
       }
 
-      @media (prefers-reduced-motion: reduce) {
-        .wptt-toolbar-pulsing [data-wptt-lightning-icon] {
-          animation: none;
-        }
+      .wptt-pulse-state:active {
+        background-color: #e7e7e7 !important;
+        border-color: #e7e7e7 !important;
+        color: #1f1f1f !important;
       }
     `;
 
@@ -3813,7 +3793,7 @@
       "border-base-content/10 my-2.5 border-t";
 
     // -------------------------------------------------------------------------
-    // Pulse preference row
+    // Pulse preference
     // -------------------------------------------------------------------------
 
     const pulseRow =
@@ -3898,9 +3878,6 @@
       pulseRow,
     );
 
-    /*
-     * Initialize before inserting into the document.
-     */
     for (
       const button of
       swatches.querySelectorAll(
@@ -4150,7 +4127,7 @@
       }
 
       return {
-        version: "0.6.0",
+        version: "0.6.1",
 
         highlight:
           state.highlightMode ===
