@@ -4414,12 +4414,12 @@
       }
 
       [data-wptt-lock-button] {
-  height: 1.75rem !important;
-  width: 1.75rem !important;
-  min-height: 1.75rem !important;
-  min-width: 1.75rem !important;
-  padding: 0 !important;
-}
+        height: 1.75rem !important;
+        width: 1.75rem !important;
+        min-height: 1.75rem !important;
+        min-width: 1.75rem !important;
+        padding: 0 !important;
+      }
 
       [data-wptt-back-divider] {
         width: 1px;
@@ -4431,6 +4431,40 @@
         opacity: 0.2;
         pointer-events: none;
       }
+
+      [data-wptt-settings-row] {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+
+      [data-wptt-settings-copy] {
+        min-width: 0;
+      }
+
+      [data-wptt-settings-controls] {
+        flex: 0 0 auto;
+      }
+
+      [data-wptt-preview-color] {
+        width: 1.25rem !important;
+        height: 1.25rem !important;
+        min-width: 1.25rem !important;
+        min-height: 1.25rem !important;
+      }
+
+    @media (max-width: 34rem) {
+      [data-wptt-settings-row="color"] {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.75rem;
+      }
+
+      [data-wptt-settings-controls] {
+        width: 100%;
+      }
+    }
     `;
 
     (
@@ -4461,11 +4495,6 @@
 
         button.classList.toggle(
           "ring-primary",
-          selected,
-        );
-
-        button.classList.toggle(
-          "scale-110",
           selected,
         );
 
@@ -4512,7 +4541,7 @@
       "";
 
     panel.className =
-      "mx-4 mt-3 rounded-xl bg-base-200/60 px-3 py-2.5";
+      "px-4 pt-4 pb-3 sm:px-5";
 
     // -------------------------------------------------------------------------
     // Color row
@@ -4523,13 +4552,19 @@
         "div",
       );
 
+    colorRow.dataset
+      .wpttSettingsRow = "color";
+
     colorRow.className =
-      "flex flex-wrap items-center justify-between gap-3";
+      "";
 
     const colorCopy =
       document.createElement(
         "div",
       );
+
+    colorCopy.dataset
+      .wpttSettingsCopy = "";
 
     const colorTitle =
       document.createElement(
@@ -4551,7 +4586,7 @@
       "text-base-content/50 text-xs";
 
     colorDescription.textContent =
-      "Used to highlight template pixels that still need work";
+      "Highlights incomplete or incorrect pixels";
 
     colorCopy.append(
       colorTitle,
@@ -4562,6 +4597,9 @@
       document.createElement(
         "div",
       );
+
+    colorControls.dataset
+      .wpttSettingsControls = "";
 
     colorControls.className =
       "flex items-center";
@@ -4673,7 +4711,7 @@
       );
 
     divider.className =
-      "border-base-content/10 my-2.5 border-t";
+      "border-base-content/10 mt-4 mb-3 border-t";
 
     // -------------------------------------------------------------------------
     // Pulse preference
@@ -4683,9 +4721,12 @@
       document.createElement(
         "label",
       );
+    
+    pulseRow.dataset
+      .wpttSettingsRow = "pulse";
 
     pulseRow.className =
-      "flex cursor-pointer items-center justify-between gap-4";
+      "cursor-pointer";
 
     const pulseCopy =
       document.createElement(
@@ -4701,7 +4742,7 @@
       "text-sm font-medium";
 
     pulseTitle.textContent =
-      "Enable pulse mode";
+      "Enable pulsing";
 
     const pulseDescription =
       document.createElement(
@@ -4712,7 +4753,7 @@
       "text-base-content/50 text-xs";
 
     pulseDescription.textContent =
-      "Clicking highlight button a second time makes highlight color pulse";
+      "Clicking highlight button twice makes pixels pulse";
 
     pulseCopy.append(
       pulseTitle,
@@ -4779,11 +4820,6 @@
 
       button.classList.toggle(
         "ring-primary",
-        selected,
-      );
-
-      button.classList.toggle(
-        "scale-110",
         selected,
       );
 
