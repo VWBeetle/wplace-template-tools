@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.1.2
+// @version      1.1.3
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
