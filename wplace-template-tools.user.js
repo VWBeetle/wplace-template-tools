@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.1.3
+// @version      1.2.0
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
@@ -59,6 +59,9 @@
 
   const SETTINGS_SELECTOR =
     "[data-wptt-settings]";
+
+  const TEMPLATE_PROGRESS_SELECTOR =
+    "[data-wptt-template-progress]";
 
   const PULSE_TOGGLE_SELECTOR =
     "[data-wptt-enable-pulse]";
@@ -219,6 +222,16 @@
     highlightMode: HIGHLIGHT_OFF,
     fullPreviewEnabled: false,
     plusPreviewEnabled: false,
+
+    progressModalVisible: false,
+    progressCaptureActive: false,
+    progressCaptureToken: 0,
+    progressCaptureTimer: 0,
+    progressCaptureSequence: 0,
+    progressCaptureCandidates: new Map(),
+    progressDesiredCounts: new Map(),
+    progressEntries: [],
+    progressLastError: null,
 
     /*
      * Added preview buttons behave like extra display modes.
@@ -1341,6 +1354,7 @@
         key,
 
         texture,
+        textureId,
         samplerUnit,
 
         width,
@@ -1864,25 +1878,12 @@
   // Geographic lookup cache
   // ===========================================================================
 
-  async function buildLookupData(
+  function buildLookupDataWithMap(
     record,
     drawInfo,
+    map,
+    templatePixels,
   ) {
-    const map =
-      await getMapInstance();
-
-    if (!map) {
-      throw new Error(
-        "MapLibre map instance is not available",
-      );
-    }
-
-    const templatePixels =
-      readTemplatePixels(
-        record,
-        drawInfo,
-      );
-
     const lookups =
       new Array(
         drawInfo.width *
@@ -1965,6 +1966,33 @@
         ...requiredTiles.entries(),
       ],
     };
+  }
+
+  async function buildLookupData(
+    record,
+    drawInfo,
+  ) {
+    const map =
+      await getMapInstance();
+
+    if (!map) {
+      throw new Error(
+        "MapLibre map instance is not available",
+      );
+    }
+
+    const templatePixels =
+      readTemplatePixels(
+        record,
+        drawInfo,
+      );
+
+    return buildLookupDataWithMap(
+      record,
+      drawInfo,
+      map,
+      templatePixels,
+    );
   }
 
   // ===========================================================================
@@ -2685,8 +2713,14 @@
           entry.mismatchCount =
             result.mismatchCount;
 
+          updateTemplateProgressUi();
           requestMapRepaint();
         } catch (error) {
+          state.progressLastError =
+            error instanceof Error
+              ? `${error.name}: ${error.message}`
+              : String(error);
+
           console.warn(
             "[Wplace Template Tools] Could not update unfinished-pixel comparison.",
             error,
@@ -2806,6 +2840,355 @@
   // Draw interception
   // ===========================================================================
 
+  function cloneDrawInfo(drawInfo) {
+    return {
+      ...drawInfo,
+
+      matrix: [
+        ...drawInfo.matrix,
+      ],
+
+      topLeft: [
+        ...drawInfo.topLeft,
+      ],
+
+      topRight: [
+        ...drawInfo.topRight,
+      ],
+
+      bottomRight: [
+        ...drawInfo.bottomRight,
+      ],
+
+      bottomLeft: [
+        ...drawInfo.bottomLeft,
+      ],
+    };
+  }
+
+  function getDrawScreenArea(
+    record,
+    drawInfo,
+  ) {
+    const corners = [
+      drawInfo.topLeft,
+      drawInfo.topRight,
+      drawInfo.bottomRight,
+      drawInfo.bottomLeft,
+    ];
+
+    const points = [];
+
+    for (const corner of corners) {
+      const clip =
+        transformLocalToClip(
+          drawInfo,
+          corner[0],
+          corner[1],
+        );
+
+      const point =
+        clipToMapScreenPoint(
+          record,
+          clip,
+        );
+
+      if (!point) {
+        return 0;
+      }
+
+      points.push(point);
+    }
+
+    let twiceArea = 0;
+
+    for (
+      let index = 0;
+      index < points.length;
+      index += 1
+    ) {
+      const current =
+        points[index];
+
+      const next =
+        points[
+          (index + 1) %
+            points.length
+        ];
+
+      twiceArea +=
+        current[0] * next[1] -
+        next[0] * current[1];
+    }
+
+    const area =
+      Math.abs(twiceArea) / 2;
+
+    return Number.isFinite(area)
+      ? area
+      : 0;
+  }
+
+  function getProgressAnchor(
+    record,
+    drawInfo,
+    map,
+  ) {
+    if (
+      !map ||
+      !looksLikeMapInstance(map)
+    ) {
+      return null;
+    }
+
+    const geographic =
+      templatePixelToLngLat(
+        record,
+        drawInfo,
+        map,
+        (
+          drawInfo.width -
+          1
+        ) /
+          2,
+        (
+          drawInfo.height -
+          1
+        ) /
+          2,
+      );
+
+    if (!geographic) {
+      return null;
+    }
+
+    return [
+      longitudeToTileX(
+        geographic.lng,
+      ),
+      latitudeToTileY(
+        geographic.lat,
+      ),
+    ];
+  }
+
+  function progressAnchorsMatch(
+    first,
+    second,
+  ) {
+    if (
+      !first ||
+      !second
+    ) {
+      return false;
+    }
+
+    return (
+      Math.abs(
+        first[0] -
+          second[0],
+      ) <
+        0.000001 &&
+      Math.abs(
+        first[1] -
+          second[1],
+      ) <
+        0.000001
+    );
+  }
+
+  function snapshotProgressLookup(
+    record,
+    drawInfo,
+  ) {
+    const map =
+      state.map;
+
+    if (
+      !map ||
+      !looksLikeMapInstance(map)
+    ) {
+      return null;
+    }
+
+    const templatePixels =
+      readTemplatePixels(
+        record,
+        drawInfo,
+      );
+
+    return {
+      anchor:
+        getProgressAnchor(
+          record,
+          drawInfo,
+          map,
+        ),
+
+      lookupData:
+        buildLookupDataWithMap(
+          record,
+          drawInfo,
+          map,
+          templatePixels,
+        ),
+    };
+  }
+
+  function applyProgressSnapshot(
+    candidate,
+    record,
+    drawInfo,
+  ) {
+    try {
+      const snapshot =
+        snapshotProgressLookup(
+          record,
+          drawInfo,
+        );
+
+      if (!snapshot) {
+        return false;
+      }
+
+      candidate.anchor =
+        snapshot.anchor;
+
+      candidate.lookupData =
+        snapshot.lookupData;
+
+      return true;
+    } catch (error) {
+      state.progressLastError =
+        error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : String(error);
+
+      console.warn(
+        "[Wplace Template Tools] Could not snapshot template placement for progress.",
+        error,
+      );
+
+      return false;
+    }
+  }
+
+  function recordProgressCandidate(
+    record,
+    drawInfo,
+  ) {
+    /*
+     * Cache the template image and its artwork-tile lookup while the matching
+     * map draw is live. Progress later uses those fixed tile locations instead
+     * of combining old draw geometry with a newer map camera.
+     */
+    const area =
+      getDrawScreenArea(
+        record,
+        drawInfo,
+      );
+
+    if (area <= 0) {
+      return;
+    }
+
+    const textureId =
+      drawInfo.textureId;
+
+    const now =
+      performance.now();
+
+    const existing =
+      state.progressCaptureCandidates.get(
+        textureId,
+      );
+
+    if (!existing) {
+      const candidate = {
+        record,
+        drawInfo:
+          cloneDrawInfo(
+            drawInfo,
+          ),
+        area,
+        lastSeenAt: now,
+        order:
+          state.progressCaptureSequence++,
+        anchor:
+          null,
+        lookupData:
+          null,
+      };
+
+      applyProgressSnapshot(
+        candidate,
+        record,
+        drawInfo,
+      );
+
+      state.progressCaptureCandidates.set(
+        textureId,
+        candidate,
+      );
+
+      return;
+    }
+
+    existing.lastSeenAt = now;
+
+    if (!existing.lookupData) {
+      applyProgressSnapshot(
+        existing,
+        record,
+        drawInfo,
+      );
+    }
+
+    /*
+     * Wplace can render a small cursor preview from the same template source.
+     * Keep the largest draw metadata. Only rebuild the fixed geographic lookup
+     * if that larger draw points to a different map location.
+     */
+    if (area > existing.area) {
+      const currentAnchor =
+        getProgressAnchor(
+          record,
+          drawInfo,
+          state.map,
+        );
+
+      const placementChanged =
+        currentAnchor &&
+        existing.anchor &&
+        !progressAnchorsMatch(
+          currentAnchor,
+          existing.anchor,
+        );
+
+      existing.record =
+        record;
+
+      existing.drawInfo =
+        cloneDrawInfo(
+          drawInfo,
+        );
+
+      existing.area =
+        area;
+
+      if (
+        !existing.lookupData ||
+        placementChanged
+      ) {
+        applyProgressSnapshot(
+          existing,
+          record,
+          drawInfo,
+        );
+      }
+    }
+  }
+
   function drawWithComparison(
     gl,
     native,
@@ -2824,11 +3207,7 @@
           )
         : null;
 
-    if (
-      !record ||
-      state.highlightMode ===
-        HIGHLIGHT_OFF
-    ) {
+    if (!record) {
       return draw();
     }
 
@@ -2838,12 +3217,29 @@
       );
 
     if (!drawInfo) {
-      native.uniform1i.call(
-        gl,
-        record.locations.maskReady,
-        0,
-      );
+      if (
+        state.highlightMode !==
+        HIGHLIGHT_OFF
+      ) {
+        native.uniform1i.call(
+          gl,
+          record.locations.maskReady,
+          0,
+        );
+      }
 
+      return draw();
+    }
+
+    recordProgressCandidate(
+      record,
+      drawInfo,
+    );
+
+    if (
+      state.highlightMode ===
+      HIGHLIGHT_OFF
+    ) {
       return draw();
     }
 
@@ -4454,6 +4850,10 @@
         min-height: 1.25rem !important;
       }
 
+      [data-wptt-template-progress] {
+        white-space: nowrap;
+      }
+
     @media (max-width: 34rem) {
       [data-wptt-settings-row="color"] {
         flex-direction: column;
@@ -5147,6 +5547,564 @@ function ensureLockButtonPresentation(
     updateButtons();
   }
 
+  function getTemplateDimensionTargets(
+    gallery,
+  ) {
+    const targets = [];
+
+    const pattern =
+      /^\s*(\d+)\s*[×x]\s*(\d+)(?:\s*(?:px|pixels?))?\s*$/i;
+
+    const walker =
+      document.createTreeWalker(
+        gallery,
+        NodeFilter.SHOW_TEXT,
+      );
+
+    while (walker.nextNode()) {
+      const textNode =
+        walker.currentNode;
+
+      const parent =
+        textNode.parentElement;
+
+      if (
+        !parent ||
+        parent.closest(
+          SETTINGS_SELECTOR,
+        ) ||
+        parent.closest(
+          TEMPLATE_PROGRESS_SELECTOR,
+        ) ||
+        parent.matches(
+          "script, style",
+        )
+      ) {
+        continue;
+      }
+
+      const match =
+        (textNode.nodeValue ?? "")
+          .match(pattern);
+
+      if (!match) {
+        continue;
+      }
+
+      targets.push({
+        textNode,
+
+        width:
+          Number(match[1]),
+
+        height:
+          Number(match[2]),
+      });
+    }
+
+    if (targets.length) {
+      return targets;
+    }
+
+    for (
+      const element of
+      gallery.querySelectorAll("*")
+    ) {
+      if (
+        element.closest(
+          SETTINGS_SELECTOR,
+        ) ||
+        element.closest(
+          TEMPLATE_PROGRESS_SELECTOR,
+        ) ||
+        element.matches(
+          "script, style",
+        )
+      ) {
+        continue;
+      }
+
+      const match =
+        (element.textContent ?? "")
+          .match(pattern);
+
+      if (!match) {
+        continue;
+      }
+
+      const childMatches =
+        [...element.children].some(
+          (child) =>
+            pattern.test(
+              child.textContent ?? "",
+            ),
+        );
+
+      if (childMatches) {
+        continue;
+      }
+
+      targets.push({
+        element,
+
+        width:
+          Number(match[1]),
+
+        height:
+          Number(match[2]),
+      });
+    }
+
+    return targets;
+  }
+
+  function getProgressDesiredCounts(
+    gallery,
+  ) {
+    const counts = new Map();
+
+    for (
+      const target of
+      getTemplateDimensionTargets(
+        gallery,
+      )
+    ) {
+      const key =
+        `${target.width}x${target.height}`;
+
+      counts.set(
+        key,
+        (counts.get(key) ?? 0) + 1,
+      );
+    }
+
+    return counts;
+  }
+
+  function getOrCreateProgressSpan(
+    target,
+  ) {
+    if (target.textNode) {
+      const parent =
+        target.textNode.parentNode;
+
+      if (!parent) {
+        return null;
+      }
+
+      let progress =
+        target.textNode.nextSibling;
+
+      if (
+        !(progress instanceof HTMLElement) ||
+        !progress.matches(
+          TEMPLATE_PROGRESS_SELECTOR,
+        )
+      ) {
+        progress =
+          document.createElement(
+            "span",
+          );
+
+        progress.dataset
+          .wpttTemplateProgress = "";
+
+        progress.setAttribute(
+          "aria-live",
+          "polite",
+        );
+
+        parent.insertBefore(
+          progress,
+          target.textNode.nextSibling,
+        );
+      }
+
+      return progress;
+    }
+
+    const element =
+      target.element;
+
+    if (!element) {
+      return null;
+    }
+
+    let progress =
+      element.querySelector(
+        `:scope > ${TEMPLATE_PROGRESS_SELECTOR}`,
+      );
+
+    if (!progress) {
+      progress =
+        document.createElement(
+          "span",
+        );
+
+      progress.dataset
+        .wpttTemplateProgress = "";
+
+      progress.setAttribute(
+        "aria-live",
+        "polite",
+      );
+
+      element.append(progress);
+    }
+
+    return progress;
+  }
+
+  function setProgressText(
+    progress,
+    text,
+  ) {
+    if (
+      progress.childNodes.length === 1 &&
+      progress.firstChild?.nodeType ===
+        Node.TEXT_NODE
+    ) {
+      if (
+        progress.firstChild.nodeValue !==
+        text
+      ) {
+        progress.firstChild.nodeValue =
+          text;
+      }
+
+      return;
+    }
+
+    progress.replaceChildren(
+      document.createTextNode(
+        text,
+      ),
+    );
+  }
+
+  function getTemplateProgressEntries() {
+    return state.progressEntries.filter(
+      (entry) =>
+        entry?.ready &&
+        Number.isFinite(
+          entry.width,
+        ) &&
+        Number.isFinite(
+          entry.height,
+        ) &&
+        entry.comparedCount > 0,
+    );
+  }
+
+  function updateTemplateProgressUi(
+    gallery = null,
+  ) {
+    if (!gallery) {
+      const templateInput =
+        document.querySelector(
+          "#template-file-input",
+        );
+
+      const dialog =
+        templateInput?.closest(
+          "dialog",
+        );
+
+      gallery =
+        dialog?.querySelector(
+          "[data-template-gallery-scroll]",
+        ) ?? null;
+    }
+
+    if (!gallery) {
+      return;
+    }
+
+    const entriesBySize =
+      new Map();
+
+    for (
+      const entry of
+      getTemplateProgressEntries()
+    ) {
+      const key =
+        `${entry.width}x${entry.height}`;
+
+      if (
+        !entriesBySize.has(key)
+      ) {
+        entriesBySize.set(
+          key,
+          [],
+        );
+      }
+
+      entriesBySize
+        .get(key)
+        .push(entry);
+    }
+
+    const usedBySize =
+      new Map();
+
+    for (
+      const target of
+      getTemplateDimensionTargets(
+        gallery,
+      )
+    ) {
+      const progress =
+        getOrCreateProgressSpan(
+          target,
+        );
+
+      if (!progress) {
+        continue;
+      }
+
+      const key =
+        `${target.width}x${target.height}`;
+
+      const index =
+        usedBySize.get(key) ?? 0;
+
+      usedBySize.set(
+        key,
+        index + 1,
+      );
+
+      const entry =
+        entriesBySize.get(key)?.[
+          index
+        ];
+
+      if (!entry) {
+        setProgressText(
+          progress,
+          " · No progress tracked",
+        );
+
+        progress.removeAttribute(
+          "title",
+        );
+
+        continue;
+      }
+
+      const total =
+        entry.comparedCount;
+
+      const placed =
+        Math.max(
+          0,
+          total -
+            entry.mismatchCount,
+        );
+
+      const percent =
+        Math.round(
+          (
+            placed /
+            total
+          ) *
+            100,
+        );
+
+      setProgressText(
+        progress,
+        ` · ${percent}% complete (${placed}/${total} pixels)`,
+      );
+
+      progress.title =
+        `${placed} of ${total} pixels complete`;
+    }
+  }
+
+  function selectProgressCandidates() {
+    const grouped =
+      new Map();
+
+    for (
+      const candidate of
+      state.progressCaptureCandidates.values()
+    ) {
+      const { drawInfo } =
+        candidate;
+
+      const key =
+        `${drawInfo.width}x${drawInfo.height}`;
+
+      if (!grouped.has(key)) {
+        grouped.set(key, []);
+      }
+
+      grouped.get(key).push(
+        candidate,
+      );
+    }
+
+    const selected = [];
+
+    for (
+      const [key, candidates] of
+      grouped
+    ) {
+      const desired =
+        state.progressDesiredCounts.get(
+          key,
+        ) ?? 0;
+
+      if (desired <= 0) {
+        continue;
+      }
+
+      candidates.sort(
+        (a, b) =>
+          b.area - a.area ||
+          (b.lastSeenAt ?? 0) -
+            (a.lastSeenAt ?? 0),
+      );
+
+      selected.push(
+        ...candidates.slice(
+          0,
+          desired,
+        ),
+      );
+    }
+
+    selected.sort(
+      (a, b) =>
+        a.order - b.order,
+    );
+
+    return selected;
+  }
+
+  function finishProgressCapture(
+    token,
+  ) {
+    if (
+      token !==
+      state.progressCaptureToken
+    ) {
+      return;
+    }
+
+    state.progressCaptureActive =
+      false;
+
+    state.progressCaptureTimer = 0;
+
+    const selected =
+      selectProgressCandidates();
+
+    state.progressEntries = [];
+
+    for (
+      const candidate of
+      selected
+    ) {
+      const {
+        record,
+        drawInfo,
+      } = candidate;
+
+      const entry =
+        getMaskEntry(
+          record,
+          drawInfo,
+        );
+
+      entry.sourceTextureId =
+        drawInfo.textureId;
+
+      entry.width =
+        drawInfo.width;
+
+      entry.height =
+        drawInfo.height;
+
+      entry.lastSeenAt =
+        performance.now();
+
+      if (!candidate.lookupData) {
+        if (!state.progressLastError) {
+          state.progressLastError =
+            "Progress placement snapshot is not available yet.";
+        }
+
+        continue;
+      }
+
+      /*
+       * Progress must use the geographic lookup captured with the live draw.
+       * Recomputing it after the modal opens can mix stale overlay geometry
+       * with a newer map camera and make the completion count drift.
+       */
+      entry.lookupData =
+        candidate.lookupData;
+
+      state.progressEntries.push(
+        entry,
+      );
+
+      scheduleMaskBuild(
+        record,
+        drawInfo,
+        entry,
+      );
+    }
+
+    updateTemplateProgressUi();
+  }
+
+  function startProgressCapture(
+    gallery,
+  ) {
+    clearTimeout(
+      state.progressCaptureTimer,
+    );
+
+    const token =
+      ++state.progressCaptureToken;
+
+    state.progressCaptureActive =
+      true;
+
+    state.progressDesiredCounts =
+      getProgressDesiredCounts(
+        gallery,
+      );
+
+    state.progressEntries = [];
+    state.progressLastError = null;
+
+    updateTemplateProgressUi(
+      gallery,
+    );
+
+    void getMapInstance();
+
+    refreshComparison();
+
+    /*
+     * Opening the template modal can pause MapLibre rendering, so preserve
+     * the draw metadata collected immediately before the modal opened.
+     * Request one final frame in case Wplace still allows it.
+     */
+    requestMapRepaint();
+
+    state.progressCaptureTimer =
+      setTimeout(
+        () =>
+          finishProgressCapture(
+            token,
+          ),
+        100,
+      );
+  }
+
   function ensureSettingsPanel() {
     const templateInput =
       document.querySelector(
@@ -5171,7 +6129,37 @@ function ensureLockButtonPresentation(
       !gallery ||
       !container
     ) {
+      state.progressModalVisible =
+        false;
+
       return;
+    }
+
+    const dialogVisible =
+      dialog.open ||
+      dialog.matches?.(
+        ":modal",
+      ) ||
+      (
+        dialog.getBoundingClientRect()
+          .width > 0 &&
+        dialog.getBoundingClientRect()
+          .height > 0
+      );
+
+    if (
+      dialogVisible &&
+      !state.progressModalVisible
+    ) {
+      state.progressModalVisible =
+        true;
+
+      startProgressCapture(
+        gallery,
+      );
+    } else if (!dialogVisible) {
+      state.progressModalVisible =
+        false;
     }
 
     if (
@@ -5186,6 +6174,9 @@ function ensureLockButtonPresentation(
     }
 
     updateSettingsUi();
+    updateTemplateProgressUi(
+      gallery,
+    );
   }
 
   function ensureUi() {
@@ -5223,6 +6214,10 @@ function ensureLockButtonPresentation(
     {
       childList: true,
       subtree: true,
+      attributes: true,
+      attributeFilter: [
+        "open",
+      ],
     },
   );
 
@@ -5261,7 +6256,7 @@ function ensureLockButtonPresentation(
       }
 
       return {
-        version: "1.1.3",
+        version: "1.1.7",
 
         highlight:
           state.highlightMode ===
@@ -5286,6 +6281,15 @@ function ensureLockButtonPresentation(
 
         mapCaptured:
           Boolean(state.map),
+
+        progressCandidates:
+          state.progressCaptureCandidates.size,
+
+        progressEntries:
+          state.progressEntries.length,
+
+        progressLastError:
+          state.progressLastError,
 
         compared,
         mismatches,
