@@ -10,6 +10,7 @@ A Tampermonkey userscript that adds extra controls to the template overlay toolb
 * Transparent overlay option can now be clicked a second time to toggle it to opaque so you can see a preview of your finished image
 * Back button label is removed from toolbar because the icon is self-explanatory
 * Adds progress tracker to template menu so you can see how much progress you've made on each template
+* Adds option to 'Mark as complete' for each template in case the progress counter bugs you (and you can also mark as incomplete)
 
 ### Highlight Toggle
 

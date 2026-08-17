@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.2.1
+// @version      1.2.2
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
@@ -63,6 +63,9 @@
   const TEMPLATE_PROGRESS_SELECTOR =
     "[data-wptt-template-progress]";
 
+  const TEMPLATE_COMPLETE_ACTION_SELECTOR =
+    "[data-wptt-template-complete-action]";
+
   const PULSE_TOGGLE_SELECTOR =
     "[data-wptt-enable-pulse]";
 
@@ -80,6 +83,9 @@
 
   const PULSE_STORAGE_KEY =
     "wplace-template-tools.enable-pulse";
+
+  const MANUAL_COMPLETE_STORAGE_KEY =
+    "wplace-template-tools.manual-complete";
 
   const PROGRESS_DB_NAME =
     "wplace-template-tools";
@@ -245,6 +251,8 @@
     progressStoredSlots: new Map(),
     progressStoragePromise: null,
     progressStorageError: null,
+    progressManualCompleteKeys:
+      loadManualCompleteKeys(),
 
     /*
      * Added preview buttons behave like extra display modes.
@@ -341,6 +349,101 @@
       );
     } catch {
       // Persistence is optional.
+    }
+  }
+
+  function loadManualCompleteKeys() {
+    try {
+      const raw =
+        globalThis.localStorage?.getItem(
+          MANUAL_COMPLETE_STORAGE_KEY,
+        );
+
+      const parsed =
+        JSON.parse(raw ?? "[]");
+
+      return new Set(
+        Array.isArray(parsed)
+          ? parsed.filter(
+              (value) =>
+                typeof value ===
+                "string",
+            )
+          : [],
+      );
+    } catch {
+      return new Set();
+    }
+  }
+
+  function saveManualCompleteKeys() {
+    try {
+      globalThis.localStorage?.setItem(
+        MANUAL_COMPLETE_STORAGE_KEY,
+        JSON.stringify(
+          [
+            ...state
+              .progressManualCompleteKeys,
+          ],
+        ),
+      );
+    } catch {
+      // Persistence is optional.
+    }
+  }
+
+  function isProgressManuallyComplete(
+    storageKey,
+  ) {
+    return (
+      typeof storageKey ===
+        "string" &&
+      state.progressManualCompleteKeys
+        .has(storageKey)
+    );
+  }
+
+  function setProgressManuallyComplete(
+    storageKey,
+    complete,
+  ) {
+    if (
+      typeof storageKey !==
+      "string"
+    ) {
+      return;
+    }
+
+    if (complete) {
+      state.progressManualCompleteKeys
+        .add(storageKey);
+    } else {
+      state.progressManualCompleteKeys
+        .delete(storageKey);
+    }
+
+    saveManualCompleteKeys();
+    updateTemplateProgressUi();
+
+    const templateInput =
+      document.querySelector(
+        "#template-file-input",
+      );
+
+    const dialog =
+      templateInput?.closest(
+        "dialog",
+      );
+
+    const gallery =
+      dialog?.querySelector(
+        "[data-template-gallery-scroll]",
+      );
+
+    if (gallery) {
+      ensureTemplateCompletionMenus(
+        gallery,
+      );
     }
   }
 
@@ -5429,6 +5532,8 @@
       }
 
       [data-wptt-template-progress] {
+        display: block;
+        width: 100%;
         white-space: nowrap;
       }
 
@@ -6450,6 +6555,29 @@ function ensureLockButtonPresentation(
         index + 1,
       );
 
+      const storageKey =
+        getProgressStorageKey(
+          target.width,
+          target.height,
+          index,
+        );
+
+      if (
+        isProgressManuallyComplete(
+          storageKey,
+        )
+      ) {
+        setProgressText(
+          progress,
+          "Complete",
+        );
+
+        progress.title =
+          "Marked complete manually";
+
+        continue;
+      }
+
       const entry =
         entriesBySize.get(key)?.[
           index
@@ -6458,7 +6586,7 @@ function ensureLockButtonPresentation(
       if (!entry) {
         setProgressText(
           progress,
-          " · No progress tracked",
+          "No progress tracked",
         );
 
         progress.removeAttribute(
@@ -6474,7 +6602,7 @@ function ensureLockButtonPresentation(
       ) {
         setProgressText(
           progress,
-          " · calculating…",
+          "calculating…",
         );
 
         progress.removeAttribute(
@@ -6505,7 +6633,7 @@ function ensureLockButtonPresentation(
 
       setProgressText(
         progress,
-        ` · ${percent}% complete (${placed}/${total} pixels)`,
+        `${percent}% complete (${placed}/${total} pixels)`,
       );
 
       progress.title =
@@ -6806,6 +6934,363 @@ function ensureLockButtonPresentation(
       );
   }
 
+  function getTemplateActionMenus(
+    gallery,
+  ) {
+    const dialog =
+      gallery?.closest("dialog");
+
+    const root =
+      dialog ?? gallery;
+
+    if (!root) {
+      return [];
+    }
+
+    return [
+      ...root.querySelectorAll(
+        "ul.dropdown-content.menu",
+      ),
+    ].filter((menu) => {
+      const labels =
+        [
+          ...menu.querySelectorAll(
+            ":scope > li > button",
+          ),
+        ].map(
+          (button) =>
+            (
+              button.textContent ??
+              ""
+            )
+              .replace(
+                /\s+/g,
+                " ",
+              )
+              .trim()
+              .toLowerCase(),
+        );
+
+      return (
+        labels.some(
+          (label) =>
+            label === "edit",
+        ) &&
+        labels.some(
+          (label) =>
+            label === "export",
+        ) &&
+        labels.some(
+          (label) =>
+            label === "delete",
+        )
+      );
+    });
+  }
+
+  function getTemplateTargetNode(
+    target,
+  ) {
+    return (
+      target.textNode ??
+      target.element ??
+      null
+    );
+  }
+
+  function getTemplateMenuProgressSlot(
+    menu,
+    gallery,
+  ) {
+    const targets =
+      getTemplateDimensionTargets(
+        gallery,
+      );
+
+    if (!targets.length) {
+      return null;
+    }
+
+    let target = null;
+    let ancestor =
+      menu.parentElement;
+
+    while (
+      ancestor &&
+      ancestor !== gallery &&
+      gallery.contains(ancestor)
+    ) {
+      const matches =
+        targets.filter(
+          (candidate) => {
+            const node =
+              getTemplateTargetNode(
+                candidate,
+              );
+
+            return (
+              node &&
+              ancestor.contains(node)
+            );
+          },
+        );
+
+      if (matches.length === 1) {
+        target = matches[0];
+        break;
+      }
+
+      ancestor =
+        ancestor.parentElement;
+    }
+
+    if (!target) {
+      return null;
+    }
+
+    const sameSize =
+      targets.filter(
+        (candidate) =>
+          candidate.width ===
+            target.width &&
+          candidate.height ===
+            target.height,
+      );
+
+    const targetNode =
+      getTemplateTargetNode(
+        target,
+      );
+
+    const slotIndex =
+      sameSize.findIndex(
+        (candidate) =>
+          getTemplateTargetNode(
+            candidate,
+          ) === targetNode,
+      );
+
+    if (slotIndex < 0) {
+      return null;
+    }
+
+    return {
+      width:
+        target.width,
+
+      height:
+        target.height,
+
+      slotIndex,
+
+      storageKey:
+        getProgressStorageKey(
+          target.width,
+          target.height,
+          slotIndex,
+        ),
+    };
+  }
+
+  function closeTemplateActionMenu(
+    menu,
+    button,
+  ) {
+    const details =
+      menu?.closest("details");
+
+    if (details) {
+      details.open = false;
+    }
+
+    button.blur();
+  }
+
+  function makeTemplateCompleteAction() {
+    const item =
+      document.createElement(
+        "li",
+      );
+
+    item.dataset
+      .wpttTemplateCompleteItem = "";
+
+    const button =
+      document.createElement(
+        "button",
+      );
+
+    button.type =
+      "button";
+
+    button.dataset
+      .wpttTemplateCompleteAction = "";
+
+    button.innerHTML = `
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 -960 960 960"
+        fill="currentColor"
+        class="size-4"
+        aria-hidden="true"
+      >
+        <path d="M382-240 154-468l57-57 171 171 367-367 57 57-424 424Z"></path>
+      </svg>
+      <span data-wptt-template-complete-label></span>
+    `;
+
+    button.addEventListener(
+      "click",
+      (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const storageKey =
+          button.dataset
+            .wpttProgressStorageKey;
+
+        if (!storageKey) {
+          return;
+        }
+
+        setProgressManuallyComplete(
+          storageKey,
+          !isProgressManuallyComplete(
+            storageKey,
+          ),
+        );
+
+        closeTemplateActionMenu(
+          button.closest(
+            "ul.dropdown-content.menu",
+          ),
+          button,
+        );
+      },
+    );
+
+    item.append(button);
+
+    return item;
+  }
+
+  function updateTemplateCompleteAction(
+    button,
+    slot,
+  ) {
+    if (
+      !button ||
+      !slot
+    ) {
+      return;
+    }
+
+    button.dataset
+      .wpttProgressStorageKey =
+      slot.storageKey;
+
+    const complete =
+      isProgressManuallyComplete(
+        slot.storageKey,
+      );
+
+    const label =
+      button.querySelector(
+        "[data-wptt-template-complete-label]",
+      );
+
+    const text =
+      complete
+        ? "Mark as incomplete"
+        : "Mark as complete";
+
+    if (
+      label &&
+      label.textContent !== text
+    ) {
+      label.textContent =
+        text;
+    }
+
+    button.setAttribute(
+      "aria-pressed",
+      String(complete),
+    );
+  }
+
+  function ensureTemplateCompletionMenus(
+    gallery,
+  ) {
+    for (
+      const menu of
+      getTemplateActionMenus(
+        gallery,
+      )
+    ) {
+      const slot =
+        getTemplateMenuProgressSlot(
+          menu,
+          gallery,
+        );
+
+      if (!slot) {
+        continue;
+      }
+
+      let button =
+        menu.querySelector(
+          TEMPLATE_COMPLETE_ACTION_SELECTOR,
+        );
+
+      if (!button) {
+        const item =
+          makeTemplateCompleteAction();
+
+        button =
+          item.querySelector(
+            TEMPLATE_COMPLETE_ACTION_SELECTOR,
+          );
+
+        const deleteButton =
+          [
+            ...menu.querySelectorAll(
+              ":scope > li > button",
+            ),
+          ].find(
+            (candidate) =>
+              (
+                candidate.textContent ??
+                ""
+              )
+                .replace(
+                  /\s+/g,
+                  " ",
+                )
+                .trim()
+                .toLowerCase() ===
+              "delete",
+          );
+
+        const deleteItem =
+          deleteButton?.parentElement;
+
+        if (deleteItem) {
+          menu.insertBefore(
+            item,
+            deleteItem,
+          );
+        } else {
+          menu.append(item);
+        }
+      }
+
+      updateTemplateCompleteAction(
+        button,
+        slot,
+      );
+    }
+  }
+
   function ensureSettingsPanel() {
     const templateInput =
       document.querySelector(
@@ -6875,6 +7360,11 @@ function ensureLockButtonPresentation(
     }
 
     updateSettingsUi();
+
+    ensureTemplateCompletionMenus(
+      gallery,
+    );
+
     updateTemplateProgressUi(
       gallery,
     );
@@ -6957,7 +7447,7 @@ function ensureLockButtonPresentation(
       }
 
       return {
-        version: "1.2.1",
+        version: "1.2.2",
 
         highlight:
           state.highlightMode ===
@@ -6991,6 +7481,9 @@ function ensureLockButtonPresentation(
 
         progressStoredSlots:
           state.progressStoredSlots.size,
+
+        progressManualComplete:
+          state.progressManualCompleteKeys.size,
 
         progressStorageError:
           state.progressStorageError,
