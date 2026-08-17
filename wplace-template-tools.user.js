@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.2.2
+// @version      1.3.0
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
@@ -66,6 +66,15 @@
   const TEMPLATE_COMPLETE_ACTION_SELECTOR =
     "[data-wptt-template-complete-action]";
 
+  const TEMPLATE_DRAG_HANDLE_SELECTOR =
+    "[data-wptt-template-drag-handle]";
+
+  const REORDER_MODE_BUTTON_SELECTOR =
+    "[data-wptt-reorder-mode-button]";
+
+  const TEMPLATE_GALLERY_ITEM_SELECTOR =
+    "[data-overlay-gallery-item]";
+
   const PULSE_TOGGLE_SELECTOR =
     "[data-wptt-enable-pulse]";
 
@@ -87,6 +96,9 @@
   const MANUAL_COMPLETE_STORAGE_KEY =
     "wplace-template-tools.manual-complete";
 
+  const TEMPLATE_ORDER_STORAGE_KEY =
+    "wplace-template-tools.template-order";
+
   const PROGRESS_DB_NAME =
     "wplace-template-tools";
 
@@ -95,7 +107,7 @@
   const PROGRESS_STORE_NAME =
     "template-progress";
 
-  const PROGRESS_STORAGE_FORMAT_VERSION = 1;
+  const PROGRESS_STORAGE_FORMAT_VERSION = 3;
 
   const ARTWORK_TILE_ZOOM = 11;
 
@@ -253,6 +265,15 @@
     progressStorageError: null,
     progressManualCompleteKeys:
       loadManualCompleteKeys(),
+    progressGallery: null,
+
+    templateOrder:
+      loadTemplateOrder(),
+
+    showReorderHandles: false,
+
+    templateDragRow: null,
+    templateDragPointerId: null,
 
     /*
      * Added preview buttons behave like extra display modes.
@@ -280,10 +301,19 @@
   const templatePixelCache =
     new WeakMap();
 
+  const textureContentVersions =
+    new WeakMap();
+
+  const galleryTemplatePixelCache =
+    new WeakMap();
+
   const artworkTileCache =
     new Map();
 
   const nativeModeButtonsBound =
+    new WeakSet();
+
+  const reorderDialogBound =
     new WeakSet();
 
   let nextTextureId = 1;
@@ -390,6 +420,122 @@
     } catch {
       // Persistence is optional.
     }
+  }
+
+  function loadTemplateOrder() {
+    try {
+      const raw =
+        globalThis.localStorage?.getItem(
+          TEMPLATE_ORDER_STORAGE_KEY,
+        );
+
+      const parsed =
+        JSON.parse(raw ?? "[]");
+
+      return Array.isArray(parsed)
+        ? parsed.filter(
+            (value) =>
+              typeof value ===
+              "string",
+          )
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveTemplateOrder(order) {
+    state.templateOrder =
+      [...order];
+
+    try {
+      globalThis.localStorage?.setItem(
+        TEMPLATE_ORDER_STORAGE_KEY,
+        JSON.stringify(
+          state.templateOrder,
+        ),
+      );
+    } catch {
+      // Persistence is optional.
+    }
+  }
+
+  function updateReorderModeButton() {
+    document
+      .querySelectorAll(
+        REORDER_MODE_BUTTON_SELECTOR,
+      )
+      .forEach((button) => {
+        const active =
+          state.showReorderHandles;
+
+        const nextClassName =
+          active
+            ? "btn btn-primary btn-sm btn-square"
+            : "btn btn-ghost btn-sm btn-square";
+
+        if (
+          button.className !==
+          nextClassName
+        ) {
+          button.className =
+            nextClassName;
+        }
+
+        button.setAttribute(
+          "aria-pressed",
+          String(active),
+        );
+
+        button.setAttribute(
+          "aria-label",
+          active
+            ? "Finish reordering overlays"
+            : "Reorder overlays",
+        );
+
+        button.title =
+          active
+            ? "Finish reordering"
+            : "Reorder overlays";
+      });
+  }
+
+  function setShowReorderHandles(
+    enabled,
+  ) {
+    enabled =
+      Boolean(enabled);
+
+    if (
+      !enabled &&
+      state.templateDragRow
+    ) {
+      state.templateDragRow
+        .removeAttribute(
+          "data-wptt-template-dragging",
+        );
+
+      state.templateDragRow =
+        null;
+
+      state.templateDragPointerId =
+        null;
+    }
+
+    state.showReorderHandles =
+      enabled;
+
+    document
+      .querySelectorAll(
+        TEMPLATE_DRAG_HANDLE_SELECTOR,
+      )
+      .forEach((handle) => {
+        handle.hidden =
+          !state.showReorderHandles;
+      });
+
+    updateReorderModeButton();
   }
 
   function isProgressManuallyComplete(
@@ -716,6 +862,31 @@
     );
   }
 
+  function getTemplateRowProgressKey(
+    row,
+    duplicateIndex = null,
+  ) {
+    if (!row) {
+      return null;
+    }
+
+    let key =
+      `row:${getTemplateRowOrderId(
+        row,
+      )}`;
+
+    if (
+      Number.isInteger(
+        duplicateIndex,
+      )
+    ) {
+      key +=
+        `:duplicate:${duplicateIndex}`;
+    }
+
+    return key;
+  }
+
   function fingerprintTemplatePixels(
     width,
     height,
@@ -744,6 +915,486 @@
         .toString(16)
         .padStart(8, "0")
     );
+  }
+
+  async function getGalleryTemplatePixels(
+    target,
+  ) {
+    const row =
+      target?.row;
+
+    if (!row) {
+      return null;
+    }
+
+    const image =
+      row.querySelector(
+        "img",
+      );
+
+    if (!image) {
+      return null;
+    }
+
+    const source =
+      image.getAttribute(
+        "src",
+      ) ?? "";
+
+    const cached =
+      galleryTemplatePixelCache.get(
+        row,
+      );
+
+    if (
+      cached &&
+      cached.width ===
+        target.width &&
+      cached.height ===
+        target.height &&
+      cached.source ===
+        source
+    ) {
+      return cached.data;
+    }
+
+    if (
+      !image.complete ||
+      image.naturalWidth < 1 ||
+      image.naturalHeight < 1
+    ) {
+      try {
+        await image.decode();
+      } catch {
+        return null;
+      }
+    }
+
+    let canvas;
+    let context;
+
+    if (
+      typeof OffscreenCanvas !==
+      "undefined"
+    ) {
+      canvas =
+        new OffscreenCanvas(
+          target.width,
+          target.height,
+        );
+
+      context =
+        canvas.getContext(
+          "2d",
+          {
+            willReadFrequently:
+              true,
+          },
+        );
+    } else {
+      canvas =
+        document.createElement(
+          "canvas",
+        );
+
+      canvas.width =
+        target.width;
+
+      canvas.height =
+        target.height;
+
+      context =
+        canvas.getContext(
+          "2d",
+          {
+            willReadFrequently:
+              true,
+          },
+        );
+    }
+
+    if (!context) {
+      return null;
+    }
+
+    context.clearRect(
+      0,
+      0,
+      target.width,
+      target.height,
+    );
+
+    context.imageSmoothingEnabled =
+      false;
+
+    context.drawImage(
+      image,
+      0,
+      0,
+      target.width,
+      target.height,
+    );
+
+    let data;
+
+    try {
+      data =
+        context.getImageData(
+          0,
+          0,
+          target.width,
+          target.height,
+        ).data;
+    } catch {
+      return null;
+    }
+
+    const copy =
+      new Uint8Array(
+        data.length,
+      );
+
+    copy.set(data);
+
+    galleryTemplatePixelCache.set(
+      row,
+      {
+        width:
+          target.width,
+
+        height:
+          target.height,
+
+        source,
+
+        data:
+          copy,
+      },
+    );
+
+    return copy;
+  }
+
+  function getTemplatePixelMatchScore(
+    candidatePixels,
+    galleryPixels,
+    width,
+    height,
+  ) {
+    if (
+      !candidatePixels ||
+      !galleryPixels ||
+      candidatePixels.length !==
+        galleryPixels.length
+    ) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    let best =
+      Number.POSITIVE_INFINITY;
+
+    for (
+      const flipX of [
+        false,
+        true,
+      ]
+    ) {
+      for (
+        const flipY of [
+          false,
+          true,
+        ]
+      ) {
+        let score = 0;
+
+        for (
+          let y = 0;
+          y < height;
+          y += 1
+        ) {
+          const sourceY =
+            flipY
+              ? height - 1 - y
+              : y;
+
+          for (
+            let x = 0;
+            x < width;
+            x += 1
+          ) {
+            const sourceX =
+              flipX
+                ? width - 1 - x
+                : x;
+
+            const candidateOffset =
+              (
+                sourceY *
+                  width +
+                sourceX
+              ) * 4;
+
+            const galleryOffset =
+              (
+                y *
+                  width +
+                x
+              ) * 4;
+
+            const candidateAlpha =
+              candidatePixels[
+                candidateOffset + 3
+              ];
+
+            const galleryAlpha =
+              galleryPixels[
+                galleryOffset + 3
+              ];
+
+            const candidateVisible =
+              candidateAlpha > 0;
+
+            const galleryVisible =
+              galleryAlpha > 0;
+
+            if (
+              !candidateVisible &&
+              !galleryVisible
+            ) {
+              continue;
+            }
+
+            if (
+              candidateVisible !==
+              galleryVisible
+            ) {
+              score += 2048;
+              continue;
+            }
+
+            score +=
+              Math.abs(
+                candidateAlpha -
+                  galleryAlpha,
+              ) * 4;
+
+            score +=
+              Math.abs(
+                candidatePixels[
+                  candidateOffset
+                ] -
+                  galleryPixels[
+                    galleryOffset
+                  ],
+              );
+
+            score +=
+              Math.abs(
+                candidatePixels[
+                  candidateOffset + 1
+                ] -
+                  galleryPixels[
+                    galleryOffset + 1
+                  ],
+              );
+
+            score +=
+              Math.abs(
+                candidatePixels[
+                  candidateOffset + 2
+                ] -
+                  galleryPixels[
+                    galleryOffset + 2
+                  ],
+              );
+
+            if (score >= best) {
+              break;
+            }
+          }
+
+          if (score >= best) {
+            break;
+          }
+        }
+
+        if (score < best) {
+          best = score;
+        }
+      }
+    }
+
+    return best;
+  }
+
+  async function matchProgressCandidatesToTargets(
+    candidates,
+    targets,
+  ) {
+    const assignments =
+      new Map();
+
+    if (
+      !candidates.length ||
+      !targets.length
+    ) {
+      return assignments;
+    }
+
+    const galleryPixels =
+      await Promise.all(
+        targets.map(
+          getGalleryTemplatePixels,
+        ),
+      );
+
+    const pairs = [];
+
+    for (
+      let candidateIndex = 0;
+      candidateIndex <
+        candidates.length;
+      candidateIndex += 1
+    ) {
+      const candidate =
+        candidates[
+          candidateIndex
+        ];
+
+      const candidatePixels =
+        candidate?.lookupData
+          ?.templatePixels;
+
+      if (!candidatePixels) {
+        continue;
+      }
+
+      for (
+        let targetIndex = 0;
+        targetIndex <
+          targets.length;
+        targetIndex += 1
+      ) {
+        const pixels =
+          galleryPixels[
+            targetIndex
+          ];
+
+        if (!pixels) {
+          continue;
+        }
+
+        pairs.push(
+          {
+            candidateIndex,
+            targetIndex,
+
+            score:
+              getTemplatePixelMatchScore(
+                candidatePixels,
+                pixels,
+                targets[
+                  targetIndex
+                ].width,
+                targets[
+                  targetIndex
+                ].height,
+              ),
+          },
+        );
+      }
+    }
+
+    pairs.sort(
+      (first, second) =>
+        first.score -
+          second.score ||
+        first.candidateIndex -
+          second.candidateIndex ||
+        first.targetIndex -
+          second.targetIndex,
+    );
+
+    const usedCandidates =
+      new Set();
+
+    const usedTargets =
+      new Set();
+
+    for (
+      const pair of pairs
+    ) {
+      if (
+        !Number.isFinite(
+          pair.score,
+        ) ||
+        usedCandidates.has(
+          pair.candidateIndex,
+        ) ||
+        usedTargets.has(
+          pair.targetIndex,
+        )
+      ) {
+        continue;
+      }
+
+      const target =
+        targets[
+          pair.targetIndex
+        ];
+
+      assignments.set(
+        target,
+        candidates[
+          pair.candidateIndex
+        ],
+      );
+
+      usedCandidates.add(
+        pair.candidateIndex,
+      );
+
+      usedTargets.add(
+        pair.targetIndex,
+      );
+    }
+
+    /*
+     * If image readback is unavailable, preserve the previously working
+     * native-order fallback instead of dropping progress entirely.
+     */
+    const remainingCandidates =
+      candidates.filter(
+        (_, index) =>
+          !usedCandidates.has(
+            index,
+          ),
+      );
+
+    const remainingTargets =
+      targets.filter(
+        (_, index) =>
+          !usedTargets.has(
+            index,
+          ),
+      );
+
+    for (
+      let index = 0;
+      index <
+        Math.min(
+          remainingCandidates.length,
+          remainingTargets.length,
+        );
+      index += 1
+    ) {
+      assignments.set(
+        remainingTargets[index],
+        remainingCandidates[index],
+      );
+    }
+
+    return assignments;
   }
 
   function makeStoredProgressRecord(
@@ -856,6 +1507,84 @@
     void saveProgressStoredSlot(
       stored,
     );
+  }
+
+  function makeLiveProgressEntry(
+    candidate,
+    slot,
+  ) {
+    const {
+      drawInfo,
+    } = candidate;
+
+    return {
+      key:
+        `progress:${slot.storageKey}`,
+
+      sourceTextureId:
+        drawInfo.textureId,
+
+      width:
+        drawInfo.width,
+
+      height:
+        drawInfo.height,
+
+      lastSeenAt:
+        performance.now(),
+
+      /*
+       * Progress-only entries never need a WebGL mismatch texture. They only
+       * need the fixed geographic lookup and comparison counts.
+       */
+      texture:
+        null,
+
+      lookupData:
+        candidate.lookupData,
+
+      ready:
+        false,
+
+      building:
+        false,
+
+      builtGeneration:
+        -1,
+
+      comparedCount:
+        0,
+
+      mismatchCount:
+        0,
+
+      buildToken:
+        0,
+
+      progressStorageKey:
+        slot.storageKey,
+
+      progressSlotIndex:
+        slot.slotIndex,
+
+      progressFingerprint:
+        fingerprintTemplatePixels(
+          drawInfo.width,
+          drawInfo.height,
+          candidate.lookupData
+            .templatePixels,
+        ),
+
+      progressAnchor:
+        candidate.anchor
+          ? [
+              ...candidate.anchor,
+            ]
+          : null,
+
+      persisted:
+        false,
+    };
   }
 
   function makeProgressEntryFromStored(
@@ -2047,10 +2776,49 @@
   // Template texture readback
   // ===========================================================================
 
+  function getTextureContentVersion(
+    texture,
+  ) {
+    return (
+      textureContentVersions.get(
+        texture,
+      ) ?? 0
+    );
+  }
+
+  function markTextureContentChanged(
+    texture,
+  ) {
+    if (!texture) {
+      return;
+    }
+
+    textureContentVersions.set(
+      texture,
+      getTextureContentVersion(
+        texture,
+      ) + 1,
+    );
+
+    /*
+     * Wplace can reuse one WebGL texture object for a different template.
+     * That is especially easy to miss when both images have the same size.
+     * Clear the readback cache as soon as new texture content is uploaded.
+     */
+    templatePixelCache.delete(
+      texture,
+    );
+  }
+
   function readTemplatePixels(
     record,
     drawInfo,
   ) {
+    const contentVersion =
+      getTextureContentVersion(
+        drawInfo.texture,
+      );
+
     const cached =
       templatePixelCache.get(
         drawInfo.texture,
@@ -2061,7 +2829,9 @@
       cached.width ===
         drawInfo.width &&
       cached.height ===
-        drawInfo.height
+        drawInfo.height &&
+      cached.contentVersion ===
+        contentVersion
     ) {
       return cached.data;
     }
@@ -2145,6 +2915,8 @@
 
           height:
             drawInfo.height,
+
+          contentVersion,
 
           data:
             pixels,
@@ -3776,12 +4548,20 @@
     const textureId =
       drawInfo.textureId;
 
+    const textureContentVersion =
+      getTextureContentVersion(
+        drawInfo.texture,
+      );
+
+    const candidateKey =
+      `${textureId}:${textureContentVersion}`;
+
     const now =
       performance.now();
 
     const existing =
       state.progressCaptureCandidates.get(
-        textureId,
+        candidateKey,
       );
 
     if (!existing) {
@@ -3799,6 +4579,7 @@
           null,
         lookupData:
           null,
+        textureContentVersion,
       };
 
       applyProgressSnapshot(
@@ -3808,7 +4589,7 @@
       );
 
       state.progressCaptureCandidates.set(
-        textureId,
+        candidateKey,
         candidate,
       );
 
@@ -4035,6 +4816,9 @@
       texImage2D:
         prototype.texImage2D,
 
+      texSubImage2D:
+        prototype.texSubImage2D,
+
       texParameteri:
         prototype.texParameteri,
 
@@ -4148,6 +4932,59 @@
           program,
         );
       };
+
+    prototype.texImage2D =
+      function texImage2D(
+        ...args
+      ) {
+        const result =
+          native.texImage2D.call(
+            this,
+            ...args,
+          );
+
+        try {
+          markTextureContentChanged(
+            native.getParameter.call(
+              this,
+              this.TEXTURE_BINDING_2D,
+            ),
+          );
+        } catch {
+          // Texture version tracking is best-effort only.
+        }
+
+        return result;
+      };
+
+    if (
+      typeof native.texSubImage2D ===
+      "function"
+    ) {
+      prototype.texSubImage2D =
+        function texSubImage2D(
+          ...args
+        ) {
+          const result =
+            native.texSubImage2D.call(
+              this,
+              ...args,
+            );
+
+          try {
+            markTextureContentChanged(
+              native.getParameter.call(
+                this,
+                this.TEXTURE_BINDING_2D,
+              ),
+            );
+          } catch {
+            // Texture version tracking is best-effort only.
+          }
+
+          return result;
+        };
+    }
 
     prototype.drawArrays =
       function drawArrays(
@@ -5537,6 +6374,30 @@
         white-space: nowrap;
       }
 
+      [data-wptt-template-drag-handle] {
+        cursor: grab;
+        touch-action: none;
+        user-select: none;
+      }
+
+      [data-wptt-template-drag-handle][hidden] {
+        display: none !important;
+      }
+
+      [data-wptt-template-drag-handle]:active {
+        cursor: grabbing;
+      }
+
+      [data-overlay-gallery-item] {
+        transition:
+          background-color 150ms ease,
+          opacity 120ms ease;
+      }
+
+      [data-overlay-gallery-item][data-wptt-template-dragging] {
+        opacity: 0.55;
+      }
+
     @media (max-width: 34rem) {
       [data-wptt-settings-row="color"] {
         flex-direction: column;
@@ -5612,6 +6473,7 @@
           ),
         );
       });
+
   }
 
   function makeSettingsPanel() {
@@ -6230,6 +7092,58 @@ function ensureLockButtonPresentation(
     updateButtons();
   }
 
+  function getTemplateNativeIndex(
+    row,
+  ) {
+    const value =
+      Number(
+        row?.dataset
+          ?.overlayGalleryIndex,
+      );
+
+    return Number.isInteger(value)
+      ? value
+      : null;
+  }
+
+  function makeTemplateDimensionTarget(
+    source,
+    width,
+    height,
+  ) {
+    const node =
+      source.textNode ??
+      source.element ??
+      null;
+
+    const row =
+      node instanceof Node
+        ? (
+            node.parentElement?.closest(
+              TEMPLATE_GALLERY_ITEM_SELECTOR,
+            ) ??
+            (
+              node instanceof Element
+                ? node.closest(
+                    TEMPLATE_GALLERY_ITEM_SELECTOR,
+                  )
+                : null
+            )
+          )
+        : null;
+
+    return {
+      ...source,
+      row,
+      nativeIndex:
+        getTemplateNativeIndex(
+          row,
+        ),
+      width,
+      height,
+    };
+  }
+
   function getTemplateDimensionTargets(
     gallery,
   ) {
@@ -6274,15 +7188,15 @@ function ensureLockButtonPresentation(
         continue;
       }
 
-      targets.push({
-        textNode,
-
-        width:
+      targets.push(
+        makeTemplateDimensionTarget(
+          {
+            textNode,
+          },
           Number(match[1]),
-
-        height:
           Number(match[2]),
-      });
+        ),
+      );
     }
 
     if (targets.length) {
@@ -6327,18 +7241,155 @@ function ensureLockButtonPresentation(
         continue;
       }
 
-      targets.push({
-        element,
-
-        width:
+      targets.push(
+        makeTemplateDimensionTarget(
+          {
+            element,
+          },
           Number(match[1]),
-
-        height:
           Number(match[2]),
-      });
+        ),
+      );
     }
 
     return targets;
+  }
+
+  function compareTemplateTargetsByNativeOrder(
+    first,
+    second,
+  ) {
+    if (
+      first.nativeIndex !== null &&
+      second.nativeIndex !== null
+    ) {
+      return (
+        first.nativeIndex -
+        second.nativeIndex
+      );
+    }
+
+    if (first.nativeIndex !== null) {
+      return -1;
+    }
+
+    if (second.nativeIndex !== null) {
+      return 1;
+    }
+
+    return 0;
+  }
+
+  function getTemplateProgressSlot(
+    target,
+    targets,
+  ) {
+    const sameSize =
+      targets
+        .filter(
+          (candidate) =>
+            candidate.width ===
+              target.width &&
+            candidate.height ===
+              target.height,
+        )
+        .sort(
+          compareTemplateTargetsByNativeOrder,
+        );
+
+    const slotIndex =
+      sameSize.indexOf(
+        target,
+      );
+
+    if (slotIndex < 0) {
+      return null;
+    }
+
+    const rowId =
+      getTemplateRowOrderId(
+        target.row,
+      );
+
+    const duplicateRows =
+      targets
+        .filter(
+          (candidate) =>
+            getTemplateRowOrderId(
+              candidate.row,
+            ) === rowId,
+        )
+        .sort(
+          compareTemplateTargetsByNativeOrder,
+        );
+
+    const duplicateIndex =
+      duplicateRows.length > 1
+        ? duplicateRows.indexOf(
+            target,
+          )
+        : null;
+
+    const storageKey =
+      getTemplateRowProgressKey(
+        target.row,
+        duplicateIndex,
+      );
+
+    if (!storageKey) {
+      return null;
+    }
+
+    const legacyStorageKey =
+      getProgressStorageKey(
+        target.width,
+        target.height,
+        slotIndex,
+      );
+
+    const uniqueSize =
+      sameSize.length === 1;
+
+    if (
+      uniqueSize &&
+      storageKey !==
+        legacyStorageKey &&
+      state.progressManualCompleteKeys
+        .has(
+          legacyStorageKey,
+        ) &&
+      !state.progressManualCompleteKeys
+        .has(storageKey)
+    ) {
+      state.progressManualCompleteKeys
+        .add(storageKey);
+
+      state.progressManualCompleteKeys
+        .delete(
+          legacyStorageKey,
+        );
+
+      saveManualCompleteKeys();
+    }
+
+    return {
+      width:
+        target.width,
+
+      height:
+        target.height,
+
+      slotIndex,
+
+      nativeIndex:
+        target.nativeIndex,
+
+      storageKey,
+
+      legacyStorageKey,
+
+      uniqueSize,
+    };
   }
 
   function getProgressDesiredCounts(
@@ -6502,38 +7553,32 @@ function ensureLockButtonPresentation(
       return;
     }
 
-    const entriesBySize =
+    const entriesByStorageKey =
       new Map();
 
     for (
       const entry of
       getTemplateProgressEntries()
     ) {
-      const key =
-        `${entry.width}x${entry.height}`;
-
       if (
-        !entriesBySize.has(key)
+        typeof entry
+          .progressStorageKey ===
+          "string"
       ) {
-        entriesBySize.set(
-          key,
-          [],
+        entriesByStorageKey.set(
+          entry.progressStorageKey,
+          entry,
         );
       }
-
-      entriesBySize
-        .get(key)
-        .push(entry);
     }
 
-    const usedBySize =
-      new Map();
-
-    for (
-      const target of
+    const targets =
       getTemplateDimensionTargets(
         gallery,
-      )
+      );
+
+    for (
+      const target of targets
     ) {
       const progress =
         getOrCreateProgressSpan(
@@ -6544,27 +7589,19 @@ function ensureLockButtonPresentation(
         continue;
       }
 
-      const key =
-        `${target.width}x${target.height}`;
-
-      const index =
-        usedBySize.get(key) ?? 0;
-
-      usedBySize.set(
-        key,
-        index + 1,
-      );
-
-      const storageKey =
-        getProgressStorageKey(
-          target.width,
-          target.height,
-          index,
+      const slot =
+        getTemplateProgressSlot(
+          target,
+          targets,
         );
+
+      if (!slot) {
+        continue;
+      }
 
       if (
         isProgressManuallyComplete(
-          storageKey,
+          slot.storageKey,
         )
       ) {
         setProgressText(
@@ -6579,9 +7616,9 @@ function ensureLockButtonPresentation(
       }
 
       const entry =
-        entriesBySize.get(key)?.[
-          index
-        ];
+        entriesByStorageKey.get(
+          slot.storageKey,
+        );
 
       if (!entry) {
         setProgressText(
@@ -6679,7 +7716,87 @@ function ensureLockButtonPresentation(
         continue;
       }
 
-      candidates.sort(
+      /*
+       * The normal overlay and cursor preview can produce separate WebGL
+       * candidates for the same template. Collapse those duplicates by their
+       * actual captured image before taking the number of gallery templates.
+       */
+      const byFingerprint =
+        new Map();
+
+      for (
+        const candidate of
+        candidates
+      ) {
+        const pixels =
+          candidate.lookupData
+            ?.templatePixels;
+
+        if (!pixels) {
+          continue;
+        }
+
+        const fingerprint =
+          fingerprintTemplatePixels(
+            candidate.drawInfo.width,
+            candidate.drawInfo.height,
+            pixels,
+          );
+
+        const existing =
+          byFingerprint.get(
+            fingerprint,
+          );
+
+        if (
+          !existing ||
+          candidate.area >
+            existing.area ||
+          (
+            candidate.area ===
+              existing.area &&
+            (
+              candidate.lastSeenAt ??
+              0
+            ) >
+              (
+                existing.lastSeenAt ??
+                0
+              )
+          )
+        ) {
+          byFingerprint.set(
+            fingerprint,
+            candidate,
+          );
+        }
+      }
+
+      let uniqueCandidates =
+        [
+          ...byFingerprint.values(),
+        ];
+
+      if (
+        uniqueCandidates.length <
+        desired
+      ) {
+        const included =
+          new Set(
+            uniqueCandidates,
+          );
+
+        uniqueCandidates.push(
+          ...candidates.filter(
+            (candidate) =>
+              !included.has(
+                candidate,
+              ),
+          ),
+        );
+      }
+
+      uniqueCandidates.sort(
         (a, b) =>
           b.area - a.area ||
           (b.lastSeenAt ?? 0) -
@@ -6687,7 +7804,7 @@ function ensureLockButtonPresentation(
       );
 
       selected.push(
-        ...candidates.slice(
+        ...uniqueCandidates.slice(
           0,
           desired,
         ),
@@ -6729,6 +7846,70 @@ function ensureLockButtonPresentation(
       return;
     }
 
+    let gallery =
+      state.progressGallery;
+
+    if (
+      !gallery ||
+      !gallery.isConnected
+    ) {
+      const templateInput =
+        document.querySelector(
+          "#template-file-input",
+        );
+
+      const dialog =
+        templateInput?.closest(
+          "dialog",
+        );
+
+      gallery =
+        dialog?.querySelector(
+          "[data-template-gallery-scroll]",
+        ) ?? null;
+    }
+
+    if (!gallery) {
+      return;
+    }
+
+    const targets =
+      getTemplateDimensionTargets(
+        gallery,
+      );
+
+    const targetsBySize =
+      new Map();
+
+    for (
+      const target of targets
+    ) {
+      const key =
+        `${target.width}x${target.height}`;
+
+      if (
+        !targetsBySize.has(key)
+      ) {
+        targetsBySize.set(
+          key,
+          [],
+        );
+      }
+
+      targetsBySize
+        .get(key)
+        .push(target);
+    }
+
+    for (
+      const group of
+      targetsBySize.values()
+    ) {
+      group.sort(
+        compareTemplateTargetsByNativeOrder,
+      );
+    }
+
     const selectedBySize =
       new Map();
 
@@ -6756,115 +7937,116 @@ function ensureLockButtonPresentation(
     state.progressEntries = [];
 
     for (
-      const [key, desired] of
-      state.progressDesiredCounts
+      const [key, groupTargets] of
+      targetsBySize
     ) {
       const candidates =
         selectedBySize.get(key) ??
         [];
 
-      const dimensions =
-        key.split("x");
+      const assignments =
+        await matchProgressCandidatesToTargets(
+          candidates,
+          groupTargets,
+        );
 
-      const width =
-        Number(dimensions[0]);
-
-      const height =
-        Number(dimensions[1]);
+      if (
+        token !==
+        state.progressCaptureToken
+      ) {
+        return;
+      }
 
       for (
-        let slotIndex = 0;
-        slotIndex < desired;
-        slotIndex += 1
+        const target of
+        groupTargets
       ) {
-        const storageKey =
-          getProgressStorageKey(
-            width,
-            height,
-            slotIndex,
+        const slot =
+          getTemplateProgressSlot(
+            target,
+            targets,
           );
 
+        if (!slot) {
+          continue;
+        }
+
         const candidate =
-          candidates[slotIndex];
+          assignments.get(
+            target,
+          );
 
         if (
           candidate?.lookupData
         ) {
-          const {
-            record,
-            drawInfo,
-          } = candidate;
-
-          const entry =
-            getMaskEntry(
-              record,
-              drawInfo,
-            );
-
-          entry.sourceTextureId =
-            drawInfo.textureId;
-
-          entry.width =
-            drawInfo.width;
-
-          entry.height =
-            drawInfo.height;
-
-          entry.lastSeenAt =
-            performance.now();
-
           /*
-           * Progress uses the geographic lookup captured with the live draw.
-           * The same data is saved so it can be reused after a page reload.
+           * Do not reuse the highlight mask cache for modal progress.
+           * Wplace can reuse the same WebGL texture/draw identity for a
+           * different template with identical dimensions, which made both
+           * gallery rows point at one mutable cache entry.
            */
-          entry.lookupData =
-            candidate.lookupData;
-
-          entry.progressStorageKey =
-            storageKey;
-
-          entry.progressSlotIndex =
-            slotIndex;
-
-          entry.progressAnchor =
-            candidate.anchor
-              ? [
-                  ...candidate.anchor,
-                ]
-              : null;
-
-          entry.progressFingerprint =
-            fingerprintTemplatePixels(
-              drawInfo.width,
-              drawInfo.height,
-              candidate.lookupData
-                .templatePixels,
+          const entry =
+            makeLiveProgressEntry(
+              candidate,
+              slot,
             );
-
-          entry.persistProgressAfterBuild =
-            true;
 
           state.progressEntries.push(
             entry,
           );
 
-          scheduleMaskBuild(
-            record,
-            drawInfo,
+          void refreshStoredProgressEntry(
             entry,
+            token,
           );
 
           continue;
         }
 
-        const stored =
+        let stored =
           state.progressStoredSlots.get(
-            storageKey,
+            slot.storageKey,
           );
 
+        /*
+         * Old slot records are only safe to migrate if no other template
+         * shares these dimensions. Ambiguous same-size records are ignored.
+         */
         if (
-          !stored?.lookupData
+          !stored?.lookupData &&
+          slot.uniqueSize
         ) {
+          const legacy =
+            state.progressStoredSlots.get(
+              slot.legacyStorageKey,
+            );
+
+          if (legacy?.lookupData) {
+            stored = {
+              ...legacy,
+
+              storageKey:
+                slot.storageKey,
+
+              slotIndex:
+                slot.slotIndex,
+
+              savedAt:
+                Date.now(),
+            };
+
+            state.progressStoredSlots.set(
+              slot.storageKey,
+              stored,
+            );
+
+            void saveProgressStoredSlot(
+              stored,
+            );
+          }
+        }
+
+        if (!stored?.lookupData) {
           continue;
         }
 
@@ -6872,6 +8054,12 @@ function ensureLockButtonPresentation(
           makeProgressEntryFromStored(
             stored,
           );
+
+        entry.progressStorageKey =
+          slot.storageKey;
+
+        entry.progressSlotIndex =
+          slot.slotIndex;
 
         state.progressEntries.push(
           entry,
@@ -6884,7 +8072,9 @@ function ensureLockButtonPresentation(
       }
     }
 
-    updateTemplateProgressUi();
+    updateTemplateProgressUi(
+      gallery,
+    );
   }
 
   function startProgressCapture(
@@ -6899,6 +8089,9 @@ function ensureLockButtonPresentation(
 
     state.progressCaptureActive =
       true;
+
+    state.progressGallery =
+      gallery;
 
     state.progressDesiredCounts =
       getProgressDesiredCounts(
@@ -7011,85 +8204,29 @@ function ensureLockButtonPresentation(
       return null;
     }
 
-    let target = null;
-    let ancestor =
-      menu.parentElement;
+    const row =
+      menu.closest(
+        TEMPLATE_GALLERY_ITEM_SELECTOR,
+      );
 
-    while (
-      ancestor &&
-      ancestor !== gallery &&
-      gallery.contains(ancestor)
-    ) {
-      const matches =
-        targets.filter(
-          (candidate) => {
-            const node =
-              getTemplateTargetNode(
-                candidate,
-              );
-
-            return (
-              node &&
-              ancestor.contains(node)
-            );
-          },
-        );
-
-      if (matches.length === 1) {
-        target = matches[0];
-        break;
-      }
-
-      ancestor =
-        ancestor.parentElement;
+    if (!row) {
+      return null;
     }
+
+    const target =
+      targets.find(
+        (candidate) =>
+          candidate.row === row,
+      );
 
     if (!target) {
       return null;
     }
 
-    const sameSize =
-      targets.filter(
-        (candidate) =>
-          candidate.width ===
-            target.width &&
-          candidate.height ===
-            target.height,
-      );
-
-    const targetNode =
-      getTemplateTargetNode(
-        target,
-      );
-
-    const slotIndex =
-      sameSize.findIndex(
-        (candidate) =>
-          getTemplateTargetNode(
-            candidate,
-          ) === targetNode,
-      );
-
-    if (slotIndex < 0) {
-      return null;
-    }
-
-    return {
-      width:
-        target.width,
-
-      height:
-        target.height,
-
-      slotIndex,
-
-      storageKey:
-        getProgressStorageKey(
-          target.width,
-          target.height,
-          slotIndex,
-        ),
-    };
+    return getTemplateProgressSlot(
+      target,
+      targets,
+    );
   }
 
   function closeTemplateActionMenu(
@@ -7291,6 +8428,871 @@ function ensureLockButtonPresentation(
     }
   }
 
+  function hashTemplateOrderText(
+    value,
+  ) {
+    let hash = 2166136261;
+
+    for (
+      let index = 0;
+      index < value.length;
+      index += 1
+    ) {
+      hash ^=
+        value.charCodeAt(
+          index,
+        );
+
+      hash =
+        Math.imul(
+          hash,
+          16777619,
+        );
+    }
+
+    return (
+      hash >>> 0
+    )
+      .toString(16)
+      .padStart(8, "0");
+  }
+
+  function getTemplateGalleryList(
+    gallery,
+  ) {
+    return (
+      gallery?.querySelector(
+        ":scope > [role='list']",
+      ) ??
+      gallery?.querySelector(
+        "[role='list']",
+      ) ??
+      null
+    );
+  }
+
+  function getTemplateGalleryRows(
+    gallery,
+  ) {
+    const list =
+      getTemplateGalleryList(
+        gallery,
+      );
+
+    if (!list) {
+      return [];
+    }
+
+    return [
+      ...list.querySelectorAll(
+        `:scope > ${TEMPLATE_GALLERY_ITEM_SELECTOR}`,
+      ),
+    ];
+  }
+
+  function getTemplateRowOrderId(
+    row,
+  ) {
+    const cached =
+      row.dataset
+        .wpttTemplateOrderId;
+
+    if (cached) {
+      return cached;
+    }
+
+    const title =
+      row.querySelector(
+        "p[title]",
+      )?.getAttribute(
+        "title",
+      ) ??
+      row.querySelector(
+        "p",
+      )?.textContent?.trim() ??
+      "";
+
+    const imageSource =
+      row.querySelector(
+        "img",
+      )?.getAttribute(
+        "src",
+      ) ??
+      "";
+
+    /*
+     * The image data makes this stable across page loads even when
+     * Wplace's numeric gallery index changes after adding or deleting
+     * another template.
+     */
+    const identitySource =
+      `${title}\n${imageSource}`;
+
+    const orderId =
+      `template:${hashTemplateOrderText(
+        identitySource,
+      )}:${identitySource.length}`;
+
+    row.dataset
+      .wpttTemplateOrderId =
+      orderId;
+
+    return orderId;
+  }
+
+  function compareTemplateRowsByNativeOrder(
+    first,
+    second,
+  ) {
+    const firstIndex =
+      getTemplateNativeIndex(
+        first,
+      );
+
+    const secondIndex =
+      getTemplateNativeIndex(
+        second,
+      );
+
+    if (
+      firstIndex !== null &&
+      secondIndex !== null
+    ) {
+      return (
+        firstIndex -
+        secondIndex
+      );
+    }
+
+    if (firstIndex !== null) {
+      return -1;
+    }
+
+    if (secondIndex !== null) {
+      return 1;
+    }
+
+    return 0;
+  }
+
+  function getTemplateRowsInDisplayOrder(
+    gallery,
+  ) {
+    return getTemplateGalleryRows(
+      gallery,
+    ).sort(
+      (first, second) => {
+        const firstOrder =
+          Number(
+            first.style.order,
+          );
+
+        const secondOrder =
+          Number(
+            second.style.order,
+          );
+
+        const safeFirst =
+          Number.isFinite(
+            firstOrder,
+          )
+            ? firstOrder
+            : 0;
+
+        const safeSecond =
+          Number.isFinite(
+            secondOrder,
+          )
+            ? secondOrder
+            : 0;
+
+        return (
+          safeFirst -
+            safeSecond ||
+          compareTemplateRowsByNativeOrder(
+            first,
+            second,
+          )
+        );
+      },
+    );
+  }
+
+  function getCompleteTemplateOrder(
+    gallery,
+  ) {
+    const rows =
+      getTemplateGalleryRows(
+        gallery,
+      );
+
+    const currentIds =
+      rows.map(
+        getTemplateRowOrderId,
+      );
+
+    const currentSet =
+      new Set(
+        currentIds,
+      );
+
+    const saved =
+      state.templateOrder.filter(
+        (id) =>
+          currentSet.has(id),
+      );
+
+    const savedSet =
+      new Set(saved);
+
+    const missing =
+      [...rows]
+        .sort(
+          compareTemplateRowsByNativeOrder,
+        )
+        .map(
+          getTemplateRowOrderId,
+        )
+        .filter(
+          (id) =>
+            !savedSet.has(id),
+        );
+
+    return [
+      ...saved,
+      ...missing,
+    ];
+  }
+
+  function applySavedTemplateOrder(
+    gallery,
+  ) {
+    const rows =
+      getTemplateGalleryRows(
+        gallery,
+      );
+
+    if (!rows.length) {
+      return;
+    }
+
+    const order =
+      getCompleteTemplateOrder(
+        gallery,
+      );
+
+    const positions =
+      new Map(
+        order.map(
+          (id, index) => [
+            id,
+            index,
+          ],
+        ),
+      );
+
+    for (
+      const row of rows
+    ) {
+      const nextOrder =
+        positions.get(
+          getTemplateRowOrderId(
+            row,
+          ),
+        );
+
+      if (
+        !Number.isInteger(
+          nextOrder,
+        )
+      ) {
+        continue;
+      }
+
+      const value =
+        String(nextOrder);
+
+      if (
+        row.style.order !==
+        value
+      ) {
+        row.style.order =
+          value;
+      }
+    }
+  }
+
+  function saveCurrentTemplateOrder(
+    gallery,
+  ) {
+    const ids =
+      getTemplateRowsInDisplayOrder(
+        gallery,
+      ).map(
+        getTemplateRowOrderId,
+      );
+
+    saveTemplateOrder(
+      ids,
+    );
+  }
+
+  function setTemplateDisplayOrder(
+    gallery,
+    rows,
+  ) {
+    const ids =
+      rows.map(
+        getTemplateRowOrderId,
+      );
+
+    saveTemplateOrder(
+      ids,
+    );
+
+    applySavedTemplateOrder(
+      gallery,
+    );
+
+    updateTemplateProgressUi(
+      gallery,
+    );
+
+    ensureTemplateCompletionMenus(
+      gallery,
+    );
+  }
+
+  function moveTemplateRowAtPointer(
+    gallery,
+    sourceRow,
+    clientY,
+  ) {
+    const rows =
+      getTemplateRowsInDisplayOrder(
+        gallery,
+      );
+
+    const sourceIndex =
+      rows.indexOf(
+        sourceRow,
+      );
+
+    if (sourceIndex < 0) {
+      return;
+    }
+
+    const galleryRect =
+      gallery.getBoundingClientRect();
+
+    const edgeSize = 36;
+
+    if (
+      clientY <
+      galleryRect.top + edgeSize
+    ) {
+      gallery.scrollTop -= 18;
+    } else if (
+      clientY >
+      galleryRect.bottom - edgeSize
+    ) {
+      gallery.scrollTop += 18;
+    }
+
+    const others =
+      rows.filter(
+        (row) =>
+          row !== sourceRow,
+      );
+
+    let insertIndex =
+      others.length;
+
+    for (
+      let index = 0;
+      index < others.length;
+      index += 1
+    ) {
+      const rect =
+        others[index]
+          .getBoundingClientRect();
+
+      if (
+        clientY <
+        rect.top +
+          rect.height / 2
+      ) {
+        insertIndex =
+          index;
+        break;
+      }
+    }
+
+    const nextRows =
+      [...others];
+
+    nextRows.splice(
+      insertIndex,
+      0,
+      sourceRow,
+    );
+
+    const changed =
+      nextRows.some(
+        (row, index) =>
+          row !== rows[index],
+      );
+
+    if (!changed) {
+      return;
+    }
+
+    setTemplateDisplayOrder(
+      gallery,
+      nextRows,
+    );
+  }
+
+  function finishTemplatePointerDrag(
+    gallery,
+    handle,
+    pointerId,
+  ) {
+    const sourceRow =
+      state.templateDragRow;
+
+    if (sourceRow) {
+      sourceRow.removeAttribute(
+        "data-wptt-template-dragging",
+      );
+    }
+
+    if (
+      pointerId !== null &&
+      handle.hasPointerCapture?.(
+        pointerId,
+      )
+    ) {
+      handle.releasePointerCapture(
+        pointerId,
+      );
+    }
+
+    state.templateDragRow =
+      null;
+
+    state.templateDragPointerId =
+      null;
+
+    saveCurrentTemplateOrder(
+      gallery,
+    );
+  }
+
+  function moveTemplateRowByKeyboard(
+    gallery,
+    row,
+    direction,
+  ) {
+    const rows =
+      getTemplateRowsInDisplayOrder(
+        gallery,
+      );
+
+    const index =
+      rows.indexOf(row);
+
+    if (index < 0) {
+      return;
+    }
+
+    const nextIndex =
+      index + direction;
+
+    if (
+      nextIndex < 0 ||
+      nextIndex >= rows.length
+    ) {
+      return;
+    }
+
+    [
+      rows[index],
+      rows[nextIndex],
+    ] = [
+      rows[nextIndex],
+      rows[index],
+    ];
+
+    setTemplateDisplayOrder(
+      gallery,
+      rows,
+    );
+  }
+
+  function makeTemplateDragHandle(
+    gallery,
+    row,
+  ) {
+    const handle =
+      document.createElement(
+        "button",
+      );
+
+    handle.type =
+      "button";
+
+    handle.className =
+      "btn btn-circle btn-ghost btn-sm shrink-0";
+
+    handle.dataset
+      .wpttTemplateDragHandle = "";
+
+    handle.hidden =
+      !state.showReorderHandles;
+
+    handle.title =
+      "Drag to reorder";
+
+    handle.setAttribute(
+      "aria-label",
+      "Drag to reorder template",
+    );
+
+    handle.setAttribute(
+      "draggable",
+      "false",
+    );
+
+    handle.innerHTML = `
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="currentColor"
+        class="size-4"
+        aria-hidden="true"
+      >
+        <circle cx="9" cy="6" r="1.5"></circle>
+        <circle cx="15" cy="6" r="1.5"></circle>
+        <circle cx="9" cy="12" r="1.5"></circle>
+        <circle cx="15" cy="12" r="1.5"></circle>
+        <circle cx="9" cy="18" r="1.5"></circle>
+        <circle cx="15" cy="18" r="1.5"></circle>
+      </svg>
+    `;
+
+    handle.addEventListener(
+      "click",
+      (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      },
+    );
+
+    handle.addEventListener(
+      "pointerdown",
+      (event) => {
+        if (
+          event.button !== 0 ||
+          state.templateDragRow
+        ) {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        state.templateDragRow =
+          row;
+
+        state.templateDragPointerId =
+          event.pointerId;
+
+        row.dataset
+          .wpttTemplateDragging = "";
+
+        handle.setPointerCapture?.(
+          event.pointerId,
+        );
+      },
+    );
+
+    handle.addEventListener(
+      "pointermove",
+      (event) => {
+        if (
+          state.templateDragRow !==
+            row ||
+          state.templateDragPointerId !==
+            event.pointerId
+        ) {
+          return;
+        }
+
+        event.preventDefault();
+
+        moveTemplateRowAtPointer(
+          gallery,
+          row,
+          event.clientY,
+        );
+      },
+    );
+
+    const endPointerDrag =
+      (event) => {
+        if (
+          state.templateDragRow !==
+            row ||
+          state.templateDragPointerId !==
+            event.pointerId
+        ) {
+          return;
+        }
+
+        event.preventDefault();
+
+        finishTemplatePointerDrag(
+          gallery,
+          handle,
+          event.pointerId,
+        );
+      };
+
+    handle.addEventListener(
+      "pointerup",
+      endPointerDrag,
+    );
+
+    handle.addEventListener(
+      "pointercancel",
+      endPointerDrag,
+    );
+
+    handle.addEventListener(
+      "keydown",
+      (event) => {
+        if (
+          event.key !== "ArrowUp" &&
+          event.key !== "ArrowDown"
+        ) {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        moveTemplateRowByKeyboard(
+          gallery,
+          row,
+          event.key === "ArrowUp"
+            ? -1
+            : 1,
+        );
+
+        handle.focus();
+      },
+    );
+
+    return handle;
+  }
+
+  function ensureTemplateReorderUi(
+    gallery,
+  ) {
+    applySavedTemplateOrder(
+      gallery,
+    );
+
+    for (
+      const row of
+      getTemplateGalleryRows(
+        gallery,
+      )
+    ) {
+      const existingHandle =
+        row.querySelector(
+          TEMPLATE_DRAG_HANDLE_SELECTOR,
+        );
+
+      if (existingHandle) {
+        existingHandle.hidden =
+          !state.showReorderHandles;
+
+        if (
+          row.firstElementChild !==
+          existingHandle
+        ) {
+          row.insertBefore(
+            existingHandle,
+            row.firstElementChild,
+          );
+        }
+
+        continue;
+      }
+
+      const actions =
+        row.querySelector(
+          ":scope > [data-overlay-actions]",
+        );
+
+      if (!actions) {
+        continue;
+      }
+
+      const handle =
+        makeTemplateDragHandle(
+          gallery,
+          row,
+        );
+
+      row.insertBefore(
+        handle,
+        row.firstElementChild,
+      );
+    }
+  }
+
+  function makeReorderModeButton() {
+    const button =
+      document.createElement(
+        "button",
+      );
+
+    button.type =
+      "button";
+
+    button.dataset
+      .wpttReorderModeButton = "";
+
+    button.setAttribute(
+      "aria-pressed",
+      "false",
+    );
+
+    button.innerHTML = `
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        fill="none"
+        viewBox="0 0 24 24"
+        stroke-width="1.5"
+        stroke="currentColor"
+        class="size-4"
+        aria-hidden="true"
+      >
+        <path
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          d="M3 7.5 7.5 3m0 0L12 7.5M7.5 3v13.5m13.5 0L16.5 21m0 0L12 16.5m4.5 4.5V7.5"
+        />
+      </svg>
+    `;
+
+    button.addEventListener(
+      "click",
+      (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        setShowReorderHandles(
+          !state.showReorderHandles,
+        );
+      },
+    );
+
+    return button;
+  }
+
+  function bindReorderDialogLifecycle(
+    dialog,
+  ) {
+    if (
+      !dialog ||
+      reorderDialogBound.has(
+        dialog,
+      )
+    ) {
+      return;
+    }
+
+    reorderDialogBound.add(
+      dialog,
+    );
+
+    const exitReorderMode =
+      () => {
+        if (
+          state.showReorderHandles
+        ) {
+          setShowReorderHandles(
+            false,
+          );
+        }
+      };
+
+    dialog.addEventListener(
+      "close",
+      exitReorderMode,
+    );
+
+    dialog.addEventListener(
+      "cancel",
+      exitReorderMode,
+    );
+  }
+
+  function ensureReorderModeButton(
+    dialog,
+  ) {
+    bindReorderDialogLifecycle(
+      dialog,
+    );
+
+    const header =
+      dialog?.querySelector(
+        "header",
+      );
+
+    if (!header) {
+      return;
+    }
+
+    const refreshButton =
+      header.querySelector(
+        'button[aria-label="Refresh"]',
+      );
+
+    if (!refreshButton) {
+      return;
+    }
+
+    let button =
+      header.querySelector(
+        REORDER_MODE_BUTTON_SELECTOR,
+      );
+
+    if (!button) {
+      button =
+        makeReorderModeButton();
+    }
+
+    /*
+     * Keep the mode control beside Wplace's Refresh action in the title row.
+     */
+    if (
+      refreshButton
+        .nextElementSibling !==
+      button
+    ) {
+      refreshButton.after(
+        button,
+      );
+    }
+
+    updateReorderModeButton();
+  }
+
   function ensureSettingsPanel() {
     const templateInput =
       document.querySelector(
@@ -7318,8 +9320,24 @@ function ensureLockButtonPresentation(
       state.progressModalVisible =
         false;
 
+      if (
+        state.showReorderHandles
+      ) {
+        setShowReorderHandles(
+          false,
+        );
+      }
+
       return;
     }
+
+    ensureTemplateReorderUi(
+      gallery,
+    );
+
+    ensureReorderModeButton(
+      dialog,
+    );
 
     const dialogVisible =
       dialog.open ||
@@ -7346,6 +9364,14 @@ function ensureLockButtonPresentation(
     } else if (!dialogVisible) {
       state.progressModalVisible =
         false;
+
+      if (
+        state.showReorderHandles
+      ) {
+        setShowReorderHandles(
+          false,
+        );
+      }
     }
 
     if (
@@ -7447,7 +9473,7 @@ function ensureLockButtonPresentation(
       }
 
       return {
-        version: "1.2.2",
+        version: "1.3.0",
 
         highlight:
           state.highlightMode ===
@@ -7476,14 +9502,90 @@ function ensureLockButtonPresentation(
         progressCandidates:
           state.progressCaptureCandidates.size,
 
+        progressCandidateDetails:
+          [
+            ...state
+              .progressCaptureCandidates
+              .values(),
+          ].map(
+            (candidate) => ({
+              size:
+                `${candidate.drawInfo.width}x${candidate.drawInfo.height}`,
+
+              textureId:
+                candidate.drawInfo.textureId,
+
+              textureContentVersion:
+                candidate.textureContentVersion ??
+                0,
+
+              fingerprint:
+                candidate.lookupData
+                  ?.templatePixels
+                  ? fingerprintTemplatePixels(
+                      candidate.drawInfo.width,
+                      candidate.drawInfo.height,
+                      candidate.lookupData
+                        .templatePixels,
+                    )
+                  : null,
+
+              area:
+                candidate.area,
+            }),
+          ),
+
         progressEntries:
           state.progressEntries.length,
+
+        progressEntryDetails:
+          state.progressEntries.map(
+            (entry) => ({
+              storageKey:
+                entry.progressStorageKey ??
+                null,
+
+              size:
+                `${entry.width}x${entry.height}`,
+
+              fingerprint:
+                entry.progressFingerprint ??
+                null,
+
+              compared:
+                entry.comparedCount ?? 0,
+
+              mismatches:
+                entry.mismatchCount ?? 0,
+
+              ready:
+                Boolean(entry.ready),
+            }),
+          ),
 
         progressStoredSlots:
           state.progressStoredSlots.size,
 
         progressManualComplete:
           state.progressManualCompleteKeys.size,
+
+        templateOrderEntries:
+          state.templateOrder.length,
+
+        stableProgressKeys:
+          state.progressEntries.filter(
+            (entry) =>
+              typeof entry
+                ?.progressStorageKey ===
+                "string" &&
+              entry.progressStorageKey
+                .startsWith(
+                  "row:",
+                ),
+          ).length,
+
+        reorderMode:
+          state.showReorderHandles,
 
         progressStorageError:
           state.progressStorageError,
