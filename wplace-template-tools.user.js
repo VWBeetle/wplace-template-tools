@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.2.0
+// @version      1.2.1
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
@@ -80,6 +80,16 @@
 
   const PULSE_STORAGE_KEY =
     "wplace-template-tools.enable-pulse";
+
+  const PROGRESS_DB_NAME =
+    "wplace-template-tools";
+
+  const PROGRESS_DB_VERSION = 1;
+
+  const PROGRESS_STORE_NAME =
+    "template-progress";
+
+  const PROGRESS_STORAGE_FORMAT_VERSION = 1;
 
   const ARTWORK_TILE_ZOOM = 11;
 
@@ -232,6 +242,9 @@
     progressDesiredCounts: new Map(),
     progressEntries: [],
     progressLastError: null,
+    progressStoredSlots: new Map(),
+    progressStoragePromise: null,
+    progressStorageError: null,
 
     /*
      * Added preview buttons behave like extra display modes.
@@ -330,6 +343,560 @@
       // Persistence is optional.
     }
   }
+
+  // ===========================================================================
+  // Progress persistence
+  // ===========================================================================
+
+  let progressDatabasePromise = null;
+
+  function describeError(error) {
+    return error instanceof Error
+      ? `${error.name}: ${error.message}`
+      : String(error);
+  }
+
+  function getProgressDatabase() {
+    if (progressDatabasePromise) {
+      return progressDatabasePromise;
+    }
+
+    progressDatabasePromise =
+      new Promise(
+        (resolve, reject) => {
+          if (!globalThis.indexedDB) {
+            reject(
+              new Error(
+                "IndexedDB is not available",
+              ),
+            );
+
+            return;
+          }
+
+          const request =
+            globalThis.indexedDB.open(
+              PROGRESS_DB_NAME,
+              PROGRESS_DB_VERSION,
+            );
+
+          request.onupgradeneeded =
+            () => {
+              const database =
+                request.result;
+
+              if (
+                !database.objectStoreNames
+                  .contains(
+                    PROGRESS_STORE_NAME,
+                  )
+              ) {
+                database.createObjectStore(
+                  PROGRESS_STORE_NAME,
+                  {
+                    keyPath:
+                      "storageKey",
+                  },
+                );
+              }
+            };
+
+          request.onsuccess =
+            () => {
+              resolve(
+                request.result,
+              );
+            };
+
+          request.onerror =
+            () => {
+              reject(
+                request.error ??
+                  new Error(
+                    "Could not open progress database",
+                  ),
+              );
+            };
+
+          request.onblocked =
+            () => {
+              reject(
+                new Error(
+                  "Progress database upgrade was blocked",
+                ),
+              );
+            };
+        },
+      );
+
+    return progressDatabasePromise;
+  }
+
+  function waitForRequest(request) {
+    return new Promise(
+      (resolve, reject) => {
+        request.onsuccess =
+          () =>
+            resolve(
+              request.result,
+            );
+
+        request.onerror =
+          () =>
+            reject(
+              request.error ??
+                new Error(
+                  "IndexedDB request failed",
+                ),
+            );
+      },
+    );
+  }
+
+  function waitForTransaction(
+    transaction,
+  ) {
+    return new Promise(
+      (resolve, reject) => {
+        transaction.oncomplete =
+          () => resolve();
+
+        transaction.onerror =
+          () =>
+            reject(
+              transaction.error ??
+                new Error(
+                  "IndexedDB transaction failed",
+                ),
+            );
+
+        transaction.onabort =
+          () =>
+            reject(
+              transaction.error ??
+                new Error(
+                  "IndexedDB transaction was aborted",
+                ),
+            );
+      },
+    );
+  }
+
+  async function ensureProgressStorageLoaded() {
+    if (state.progressStoragePromise) {
+      return state.progressStoragePromise;
+    }
+
+    state.progressStoragePromise =
+      (async () => {
+        try {
+          const database =
+            await getProgressDatabase();
+
+          const transaction =
+            database.transaction(
+              PROGRESS_STORE_NAME,
+              "readonly",
+            );
+
+          const store =
+            transaction.objectStore(
+              PROGRESS_STORE_NAME,
+            );
+
+          const records =
+            await waitForRequest(
+              store.getAll(),
+            );
+
+          await waitForTransaction(
+            transaction,
+          );
+
+          state.progressStoredSlots.clear();
+
+          for (
+            const record of
+            records
+          ) {
+            if (
+              !record ||
+              record.formatVersion !==
+                PROGRESS_STORAGE_FORMAT_VERSION ||
+              typeof record.storageKey !==
+                "string" ||
+              !record.lookupData
+            ) {
+              continue;
+            }
+
+            state.progressStoredSlots.set(
+              record.storageKey,
+              record,
+            );
+          }
+
+          state.progressStorageError =
+            null;
+        } catch (error) {
+          state.progressStorageError =
+            describeError(error);
+
+          console.warn(
+            "[Wplace Template Tools] Could not load saved template progress.",
+            error,
+          );
+        }
+
+        return state.progressStoredSlots;
+      })();
+
+    return state.progressStoragePromise;
+  }
+
+  async function saveProgressStoredSlot(
+    stored,
+  ) {
+    if (
+      !stored?.storageKey ||
+      !stored.lookupData
+    ) {
+      return;
+    }
+
+    state.progressStoredSlots.set(
+      stored.storageKey,
+      stored,
+    );
+
+    try {
+      const database =
+        await getProgressDatabase();
+
+      const transaction =
+        database.transaction(
+          PROGRESS_STORE_NAME,
+          "readwrite",
+        );
+
+      transaction
+        .objectStore(
+          PROGRESS_STORE_NAME,
+        )
+        .put(stored);
+
+      await waitForTransaction(
+        transaction,
+      );
+
+      state.progressStorageError =
+        null;
+    } catch (error) {
+      state.progressStorageError =
+        describeError(error);
+
+      console.warn(
+        "[Wplace Template Tools] Could not save template progress.",
+        error,
+      );
+    }
+  }
+
+  function getProgressStorageKey(
+    width,
+    height,
+    slotIndex,
+  ) {
+    return (
+      `${width}x${height}:` +
+      slotIndex
+    );
+  }
+
+  function fingerprintTemplatePixels(
+    width,
+    height,
+    pixels,
+  ) {
+    let hash = 2166136261;
+
+    for (
+      let index = 0;
+      index < pixels.length;
+      index += 1
+    ) {
+      hash ^=
+        pixels[index];
+
+      hash =
+        Math.imul(
+          hash,
+          16777619,
+        );
+    }
+
+    return (
+      `${width}x${height}:` +
+      (hash >>> 0)
+        .toString(16)
+        .padStart(8, "0")
+    );
+  }
+
+  function makeStoredProgressRecord(
+    entry,
+  ) {
+    if (
+      !entry?.progressStorageKey ||
+      !entry.lookupData
+    ) {
+      return null;
+    }
+
+    const templatePixels =
+      entry.lookupData
+        .templatePixels;
+
+    return {
+      formatVersion:
+        PROGRESS_STORAGE_FORMAT_VERSION,
+
+      storageKey:
+        entry.progressStorageKey,
+
+      width:
+        entry.width,
+
+      height:
+        entry.height,
+
+      slotIndex:
+        entry.progressSlotIndex ?? 0,
+
+      fingerprint:
+        entry.progressFingerprint ??
+        (
+          templatePixels
+            ? fingerprintTemplatePixels(
+                entry.width,
+                entry.height,
+                templatePixels,
+              )
+            : null
+        ),
+
+      anchor:
+        entry.progressAnchor
+          ? [
+              ...entry.progressAnchor,
+            ]
+          : null,
+
+      lookupData:
+        entry.lookupData,
+
+      comparedCount:
+        entry.comparedCount,
+
+      mismatchCount:
+        entry.mismatchCount,
+
+      savedAt:
+        Date.now(),
+    };
+  }
+
+  function persistProgressEntry(
+    entry,
+  ) {
+    const stored =
+      makeStoredProgressRecord(
+        entry,
+      );
+
+    if (!stored) {
+      return;
+    }
+
+    const previous =
+      state.progressStoredSlots.get(
+        stored.storageKey,
+      );
+
+    const sameAnchor =
+      (
+        !stored.anchor &&
+        !previous?.anchor
+      ) ||
+      (
+        stored.anchor &&
+        previous?.anchor &&
+        progressAnchorsMatch(
+          stored.anchor,
+          previous.anchor,
+        )
+      );
+
+    if (
+      previous &&
+      previous.fingerprint ===
+        stored.fingerprint &&
+      previous.comparedCount ===
+        stored.comparedCount &&
+      previous.mismatchCount ===
+        stored.mismatchCount &&
+      sameAnchor
+    ) {
+      return;
+    }
+
+    void saveProgressStoredSlot(
+      stored,
+    );
+  }
+
+  function makeProgressEntryFromStored(
+    stored,
+  ) {
+    return {
+      key:
+        `stored:${stored.storageKey}`,
+
+      sourceTextureId:
+        null,
+
+      width:
+        stored.width,
+
+      height:
+        stored.height,
+
+      lastSeenAt:
+        0,
+
+      texture:
+        null,
+
+      lookupData:
+        stored.lookupData,
+
+      ready:
+        Number.isFinite(
+          stored.comparedCount,
+        ) &&
+        stored.comparedCount > 0,
+
+      building:
+        false,
+
+      builtGeneration:
+        -1,
+
+      comparedCount:
+        Number.isFinite(
+          stored.comparedCount,
+        )
+          ? stored.comparedCount
+          : 0,
+
+      mismatchCount:
+        Number.isFinite(
+          stored.mismatchCount,
+        )
+          ? stored.mismatchCount
+          : 0,
+
+      buildToken:
+        0,
+
+      progressStorageKey:
+        stored.storageKey,
+
+      progressSlotIndex:
+        stored.slotIndex ?? 0,
+
+      progressFingerprint:
+        stored.fingerprint ?? null,
+
+      progressAnchor:
+        stored.anchor
+          ? [
+              ...stored.anchor,
+            ]
+          : null,
+
+      persisted:
+        true,
+    };
+  }
+
+  async function refreshStoredProgressEntry(
+    entry,
+    captureToken,
+  ) {
+    if (
+      !entry?.lookupData ||
+      entry.building
+    ) {
+      return;
+    }
+
+    entry.building = true;
+
+    try {
+      const generation =
+        artworkGeneration;
+
+      const result =
+        await buildMismatchMask(
+          null,
+          {
+            width:
+              entry.width,
+
+            height:
+              entry.height,
+          },
+          entry,
+        );
+
+      if (
+        captureToken !==
+        state.progressCaptureToken
+      ) {
+        return;
+      }
+
+      entry.ready = true;
+
+      entry.builtGeneration =
+        generation;
+
+      entry.comparedCount =
+        result.comparedCount;
+
+      entry.mismatchCount =
+        result.mismatchCount;
+
+      persistProgressEntry(
+        entry,
+      );
+
+      updateTemplateProgressUi();
+    } catch (error) {
+      state.progressLastError =
+        describeError(error);
+
+      console.warn(
+        "[Wplace Template Tools] Could not refresh saved template progress.",
+        error,
+      );
+    } finally {
+      entry.building = false;
+    }
+  }
+
+  void ensureProgressStorageLoaded();
 
   // ===========================================================================
   // MapLibre capture
@@ -2712,6 +3279,17 @@
 
           entry.mismatchCount =
             result.mismatchCount;
+
+          if (
+            entry.persistProgressAfterBuild
+          ) {
+            entry.persistProgressAfterBuild =
+              false;
+
+            persistProgressEntry(
+              entry,
+            );
+          }
 
           updateTemplateProgressUi();
           requestMapRepaint();
@@ -5785,14 +6363,13 @@ function ensureLockButtonPresentation(
   function getTemplateProgressEntries() {
     return state.progressEntries.filter(
       (entry) =>
-        entry?.ready &&
+        entry &&
         Number.isFinite(
           entry.width,
         ) &&
         Number.isFinite(
           entry.height,
-        ) &&
-        entry.comparedCount > 0,
+        ),
     );
   }
 
@@ -5882,6 +6459,22 @@ function ensureLockButtonPresentation(
         setProgressText(
           progress,
           " · No progress tracked",
+        );
+
+        progress.removeAttribute(
+          "title",
+        );
+
+        continue;
+      }
+
+      if (
+        !entry.ready ||
+        entry.comparedCount <= 0
+      ) {
+        setProgressText(
+          progress,
+          " · calculating…",
         );
 
         progress.removeAttribute(
@@ -5981,7 +6574,7 @@ function ensureLockButtonPresentation(
     return selected;
   }
 
-  function finishProgressCapture(
+  async function finishProgressCapture(
     token,
   ) {
     if (
@@ -5999,61 +6592,168 @@ function ensureLockButtonPresentation(
     const selected =
       selectProgressCandidates();
 
-    state.progressEntries = [];
+    await ensureProgressStorageLoaded();
+
+    if (
+      token !==
+      state.progressCaptureToken
+    ) {
+      return;
+    }
+
+    const selectedBySize =
+      new Map();
 
     for (
       const candidate of
       selected
     ) {
-      const {
-        record,
-        drawInfo,
-      } = candidate;
+      const key =
+        `${candidate.drawInfo.width}x${candidate.drawInfo.height}`;
 
-      const entry =
-        getMaskEntry(
-          record,
-          drawInfo,
+      if (
+        !selectedBySize.has(key)
+      ) {
+        selectedBySize.set(
+          key,
+          [],
         );
-
-      entry.sourceTextureId =
-        drawInfo.textureId;
-
-      entry.width =
-        drawInfo.width;
-
-      entry.height =
-        drawInfo.height;
-
-      entry.lastSeenAt =
-        performance.now();
-
-      if (!candidate.lookupData) {
-        if (!state.progressLastError) {
-          state.progressLastError =
-            "Progress placement snapshot is not available yet.";
-        }
-
-        continue;
       }
 
-      /*
-       * Progress must use the geographic lookup captured with the live draw.
-       * Recomputing it after the modal opens can mix stale overlay geometry
-       * with a newer map camera and make the completion count drift.
-       */
-      entry.lookupData =
-        candidate.lookupData;
+      selectedBySize
+        .get(key)
+        .push(candidate);
+    }
 
-      state.progressEntries.push(
-        entry,
-      );
+    state.progressEntries = [];
 
-      scheduleMaskBuild(
-        record,
-        drawInfo,
-        entry,
-      );
+    for (
+      const [key, desired] of
+      state.progressDesiredCounts
+    ) {
+      const candidates =
+        selectedBySize.get(key) ??
+        [];
+
+      const dimensions =
+        key.split("x");
+
+      const width =
+        Number(dimensions[0]);
+
+      const height =
+        Number(dimensions[1]);
+
+      for (
+        let slotIndex = 0;
+        slotIndex < desired;
+        slotIndex += 1
+      ) {
+        const storageKey =
+          getProgressStorageKey(
+            width,
+            height,
+            slotIndex,
+          );
+
+        const candidate =
+          candidates[slotIndex];
+
+        if (
+          candidate?.lookupData
+        ) {
+          const {
+            record,
+            drawInfo,
+          } = candidate;
+
+          const entry =
+            getMaskEntry(
+              record,
+              drawInfo,
+            );
+
+          entry.sourceTextureId =
+            drawInfo.textureId;
+
+          entry.width =
+            drawInfo.width;
+
+          entry.height =
+            drawInfo.height;
+
+          entry.lastSeenAt =
+            performance.now();
+
+          /*
+           * Progress uses the geographic lookup captured with the live draw.
+           * The same data is saved so it can be reused after a page reload.
+           */
+          entry.lookupData =
+            candidate.lookupData;
+
+          entry.progressStorageKey =
+            storageKey;
+
+          entry.progressSlotIndex =
+            slotIndex;
+
+          entry.progressAnchor =
+            candidate.anchor
+              ? [
+                  ...candidate.anchor,
+                ]
+              : null;
+
+          entry.progressFingerprint =
+            fingerprintTemplatePixels(
+              drawInfo.width,
+              drawInfo.height,
+              candidate.lookupData
+                .templatePixels,
+            );
+
+          entry.persistProgressAfterBuild =
+            true;
+
+          state.progressEntries.push(
+            entry,
+          );
+
+          scheduleMaskBuild(
+            record,
+            drawInfo,
+            entry,
+          );
+
+          continue;
+        }
+
+        const stored =
+          state.progressStoredSlots.get(
+            storageKey,
+          );
+
+        if (
+          !stored?.lookupData
+        ) {
+          continue;
+        }
+
+        const entry =
+          makeProgressEntryFromStored(
+            stored,
+          );
+
+        state.progressEntries.push(
+          entry,
+        );
+
+        void refreshStoredProgressEntry(
+          entry,
+          token,
+        );
+      }
     }
 
     updateTemplateProgressUi();
@@ -6097,10 +6797,11 @@ function ensureLockButtonPresentation(
 
     state.progressCaptureTimer =
       setTimeout(
-        () =>
-          finishProgressCapture(
+        () => {
+          void finishProgressCapture(
             token,
-          ),
+          );
+        },
         100,
       );
   }
@@ -6256,7 +6957,7 @@ function ensureLockButtonPresentation(
       }
 
       return {
-        version: "1.1.7",
+        version: "1.2.1",
 
         highlight:
           state.highlightMode ===
@@ -6287,6 +6988,12 @@ function ensureLockButtonPresentation(
 
         progressEntries:
           state.progressEntries.length,
+
+        progressStoredSlots:
+          state.progressStoredSlots.size,
+
+        progressStorageError:
+          state.progressStorageError,
 
         progressLastError:
           state.progressLastError,
