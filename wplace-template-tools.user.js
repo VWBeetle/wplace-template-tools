@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.3.1
+// @version      1.3.2
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
@@ -7672,6 +7672,18 @@ function ensureLockButtonPresentation(
     );
   }
 
+  function refreshTemplateProgressModalUi(
+    gallery,
+  ) {
+    ensureTemplateCompletionMenus(
+      gallery,
+    );
+
+    updateTemplateProgressUi(
+      gallery,
+    );
+  }
+
   function updateTemplateProgressUi(
     gallery = null,
   ) {
@@ -8241,7 +8253,7 @@ function ensureLockButtonPresentation(
     state.progressEntries =
       progressEntries;
 
-    updateTemplateProgressUi(
+    refreshTemplateProgressModalUi(
       gallery,
     );
   }
@@ -8430,6 +8442,159 @@ function ensureLockButtonPresentation(
     });
   }
 
+  function keepTemplateActionMenuVisible(
+    menu,
+    gallery,
+  ) {
+    if (
+      !menu ||
+      !gallery
+    ) {
+      return 0;
+    }
+
+    menu.style.removeProperty(
+      "translate",
+    );
+
+    const menuRect =
+      menu.getBoundingClientRect();
+
+    const galleryRect =
+      gallery.getBoundingClientRect();
+
+    if (
+      menuRect.width < 1 ||
+      menuRect.height < 1 ||
+      galleryRect.width < 1 ||
+      galleryRect.height < 1
+    ) {
+      return 0;
+    }
+
+    const inset = 4;
+
+    const minimumTop =
+      galleryRect.top + inset;
+
+    const maximumBottom =
+      galleryRect.bottom - inset;
+
+    let offset = 0;
+
+    if (
+      menuRect.top < minimumTop
+    ) {
+      offset =
+        minimumTop - menuRect.top;
+    }
+
+    if (
+      menuRect.bottom + offset >
+      maximumBottom
+    ) {
+      offset +=
+        maximumBottom -
+        (
+          menuRect.bottom + offset
+        );
+    }
+
+    if (Math.abs(offset) >= 1) {
+      menu.style.setProperty(
+        "translate",
+        `0 ${Math.round(offset)}px`,
+      );
+    }
+
+    menu.style.setProperty(
+      "z-index",
+      "100",
+    );
+
+    return offset;
+  }
+
+  function ensureTemplateActionMenuPositioning(
+    menu,
+    gallery,
+  ) {
+    if (
+      !menu ||
+      "wpttMenuPositioningBound" in
+        menu.dataset
+    ) {
+      return;
+    }
+
+    menu.dataset
+      .wpttMenuPositioningBound = "";
+
+    const dropdown =
+      menu.closest(
+        ".dropdown, details",
+      ) ??
+      menu.parentElement;
+
+    if (!dropdown) {
+      return;
+    }
+
+    let frame = 0;
+
+    const schedule = () => {
+      cancelAnimationFrame(
+        frame,
+      );
+
+      frame =
+        requestAnimationFrame(
+          () => {
+            /*
+             * DaisyUI reveals dropdowns from focus state. Wait one more
+             * frame so the menu has its open geometry before measuring it.
+             */
+            frame =
+              requestAnimationFrame(
+                () => {
+                  frame = 0;
+
+                  keepTemplateActionMenuVisible(
+                    menu,
+                    gallery,
+                  );
+                },
+              );
+          },
+        );
+    };
+
+    dropdown.addEventListener(
+      "pointerdown",
+      schedule,
+      true,
+    );
+
+    dropdown.addEventListener(
+      "click",
+      schedule,
+      true,
+    );
+
+    dropdown.addEventListener(
+      "focusin",
+      schedule,
+      true,
+    );
+
+    dropdown.addEventListener(
+      "toggle",
+      schedule,
+    );
+
+    schedule();
+  }
+
   function getTemplateTargetNode(
     target,
   ) {
@@ -8613,6 +8778,11 @@ function ensureLockButtonPresentation(
         gallery,
       )
     ) {
+      ensureTemplateActionMenuPositioning(
+        menu,
+        gallery,
+      );
+
       const slot =
         getTemplateMenuProgressSlot(
           menu,
@@ -8620,6 +8790,11 @@ function ensureLockButtonPresentation(
         );
 
       if (!slot) {
+        keepTemplateActionMenuVisible(
+          menu,
+          gallery,
+        );
+
         continue;
       }
 
@@ -8673,6 +8848,11 @@ function ensureLockButtonPresentation(
       updateTemplateCompleteAction(
         button,
         slot,
+      );
+
+      keepTemplateActionMenuVisible(
+        menu,
+        gallery,
       );
     }
   }
@@ -10206,7 +10386,7 @@ function ensureLockButtonPresentation(
       }
 
       return {
-        version: "1.3.1",
+        version: "1.3.2",
 
         highlight:
           state.highlightMode ===
