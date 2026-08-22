@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Template Tools
 // @namespace    https://github.com/VWBeetle/wplace-template-tools
-// @version      1.3.0
+// @version      1.3.1
 // @license      MIT
 // @description  Extra tools for use with Wplace overlays
 // @downloadURL  https://raw.githubusercontent.com/vwbeetle/wplace-template-tools/main/wplace-template-tools.user.js
@@ -98,6 +98,12 @@
 
   const TEMPLATE_ORDER_STORAGE_KEY =
     "wplace-template-tools.template-order";
+
+  const WPLACE_TEMPLATE_STORAGE_KEY =
+    "template-overlays";
+
+  const WPLACE_TEMPLATE_ORDER_ID_PREFIX =
+    "wplace-template:";
 
   const PROGRESS_DB_NAME =
     "wplace-template-tools";
@@ -870,10 +876,27 @@
       return null;
     }
 
-    let key =
-      `row:${getTemplateRowOrderId(
+    return getTemplateRowProgressKeyForOrderId(
+      getTemplateRowOrderId(
         row,
-      )}`;
+      ),
+      duplicateIndex,
+    );
+  }
+
+  function getTemplateRowProgressKeyForOrderId(
+    orderId,
+    duplicateIndex = null,
+  ) {
+    if (
+      typeof orderId !== "string" ||
+      !orderId
+    ) {
+      return null;
+    }
+
+    let key =
+      `row:${orderId}`;
 
     if (
       Number.isInteger(
@@ -7306,10 +7329,21 @@ function ensureLockButtonPresentation(
       return null;
     }
 
+    const uniqueSize =
+      sameSize.length === 1;
+
     const rowId =
       getTemplateRowOrderId(
         target.row,
       );
+
+    /*
+     * With same-sized templates, any identity that does not include the
+     * loaded thumbnail can attach another template's progress to this row.
+     */
+    if (!rowId) {
+      return null;
+    }
 
     const duplicateRows =
       targets
@@ -7347,27 +7381,78 @@ function ensureLockButtonPresentation(
         slotIndex,
       );
 
-    const uniqueSize =
-      sameSize.length === 1;
+    let legacyStorageKeys = [];
+
+    if (uniqueSize) {
+      const unloadedRowId =
+        getUnloadedTemplateRowOrderId(
+          target.row,
+        );
+
+      const unloadedDuplicateRows =
+        targets
+          .filter(
+            (candidate) =>
+              getUnloadedTemplateRowOrderId(
+                candidate.row,
+              ) === unloadedRowId,
+          )
+          .sort(
+            compareTemplateTargetsByNativeOrder,
+          );
+
+      const unloadedDuplicateIndex =
+        unloadedDuplicateRows.length > 1
+          ? unloadedDuplicateRows.indexOf(
+              target,
+            )
+          : null;
+
+      legacyStorageKeys = [
+        getTemplateRowProgressKeyForOrderId(
+          getWplaceTemplateRowOrderId(
+            target.row,
+          ),
+          null,
+        ),
+        getTemplateRowProgressKeyForOrderId(
+          unloadedRowId,
+          unloadedDuplicateIndex,
+        ),
+        legacyStorageKey,
+      ];
+    }
+
+    legacyStorageKeys =
+      legacyStorageKeys.filter(
+        (key, index, keys) =>
+          key &&
+          key !== storageKey &&
+          keys.indexOf(key) === index,
+      );
+
+    const manuallyCompleteLegacyKey =
+      legacyStorageKeys.find(
+        (key) =>
+          state.progressManualCompleteKeys
+            .has(key),
+      );
 
     if (
-      uniqueSize &&
-      storageKey !==
-        legacyStorageKey &&
-      state.progressManualCompleteKeys
-        .has(
-          legacyStorageKey,
-        ) &&
+      manuallyCompleteLegacyKey &&
       !state.progressManualCompleteKeys
         .has(storageKey)
     ) {
       state.progressManualCompleteKeys
         .add(storageKey);
 
-      state.progressManualCompleteKeys
-        .delete(
-          legacyStorageKey,
-        );
+      for (
+        const key of
+        legacyStorageKeys
+      ) {
+        state.progressManualCompleteKeys
+          .delete(key);
+      }
 
       saveManualCompleteKeys();
     }
@@ -7388,8 +7473,66 @@ function ensureLockButtonPresentation(
 
       legacyStorageKey,
 
+      legacyStorageKeys,
+
       uniqueSize,
     };
+  }
+
+  function getStoredProgressForSlot(
+    slot,
+  ) {
+    let stored =
+      state.progressStoredSlots.get(
+        slot.storageKey,
+      );
+
+    if (stored?.lookupData) {
+      return stored;
+    }
+
+    const legacyStorageKey =
+      slot.legacyStorageKeys.find(
+        (storageKey) =>
+          state.progressStoredSlots
+            .get(storageKey)
+            ?.lookupData,
+      );
+
+    const legacy =
+      legacyStorageKey
+        ? state.progressStoredSlots.get(
+            legacyStorageKey,
+          )
+        : null;
+
+    if (!legacy?.lookupData) {
+      return null;
+    }
+
+    stored = {
+      ...legacy,
+
+      storageKey:
+        slot.storageKey,
+
+      slotIndex:
+        slot.slotIndex,
+
+      savedAt:
+        Date.now(),
+    };
+
+    state.progressStoredSlots.set(
+      slot.storageKey,
+      stored,
+    );
+
+    void saveProgressStoredSlot(
+      stored,
+    );
+
+    return stored;
   }
 
   function getProgressDesiredCounts(
@@ -7596,6 +7739,21 @@ function ensureLockButtonPresentation(
         );
 
       if (!slot) {
+        if (
+          target.row &&
+          !target.row.dataset
+            .wpttTemplateProgressOrderId
+        ) {
+          setProgressText(
+            progress,
+            "loading template…",
+          );
+
+          progress.removeAttribute(
+            "title",
+          );
+        }
+
         continue;
       }
 
@@ -7615,10 +7773,49 @@ function ensureLockButtonPresentation(
         continue;
       }
 
-      const entry =
+      let entry =
         entriesByStorageKey.get(
           slot.storageKey,
         );
+
+      /*
+       * The thumbnail may have loaded after the capture pass. Check stored
+       * aliases again during the next DOM refresh so an older progress key
+       * can migrate without reopening the modal.
+       */
+      if (!entry) {
+        const stored =
+          getStoredProgressForSlot(
+            slot,
+          );
+
+        if (stored?.lookupData) {
+          entry =
+            makeProgressEntryFromStored(
+              stored,
+            );
+
+          entry.progressStorageKey =
+            slot.storageKey;
+
+          entry.progressSlotIndex =
+            slot.slotIndex;
+
+          state.progressEntries.push(
+            entry,
+          );
+
+          entriesByStorageKey.set(
+            slot.storageKey,
+            entry,
+          );
+
+          void refreshStoredProgressEntry(
+            entry,
+            state.progressCaptureToken,
+          );
+        }
+      }
 
       if (!entry) {
         setProgressText(
@@ -7934,7 +8131,7 @@ function ensureLockButtonPresentation(
         .push(candidate);
     }
 
-    state.progressEntries = [];
+    const progressEntries = [];
 
     for (
       const [key, groupTargets] of
@@ -7991,7 +8188,7 @@ function ensureLockButtonPresentation(
               slot,
             );
 
-          state.progressEntries.push(
+          progressEntries.push(
             entry,
           );
 
@@ -8003,48 +8200,10 @@ function ensureLockButtonPresentation(
           continue;
         }
 
-        let stored =
-          state.progressStoredSlots.get(
-            slot.storageKey,
+        const stored =
+          getStoredProgressForSlot(
+            slot,
           );
-
-        /*
-         * Old slot records are only safe to migrate if no other template
-         * shares these dimensions. Ambiguous same-size records are ignored.
-         */
-        if (
-          !stored?.lookupData &&
-          slot.uniqueSize
-        ) {
-          const legacy =
-            state.progressStoredSlots.get(
-              slot.legacyStorageKey,
-            );
-
-          if (legacy?.lookupData) {
-            stored = {
-              ...legacy,
-
-              storageKey:
-                slot.storageKey,
-
-              slotIndex:
-                slot.slotIndex,
-
-              savedAt:
-                Date.now(),
-            };
-
-            state.progressStoredSlots.set(
-              slot.storageKey,
-              stored,
-            );
-
-            void saveProgressStoredSlot(
-              stored,
-            );
-          }
-        }
 
         if (!stored?.lookupData) {
           continue;
@@ -8061,7 +8220,7 @@ function ensureLockButtonPresentation(
         entry.progressSlotIndex =
           slot.slotIndex;
 
-        state.progressEntries.push(
+        progressEntries.push(
           entry,
         );
 
@@ -8072,14 +8231,28 @@ function ensureLockButtonPresentation(
       }
     }
 
+    if (
+      token !==
+      state.progressCaptureToken
+    ) {
+      return;
+    }
+
+    state.progressEntries =
+      progressEntries;
+
     updateTemplateProgressUi(
       gallery,
     );
   }
 
-  function startProgressCapture(
+  function scheduleProgressCaptureFinish(
     gallery,
+    delay = 100,
   ) {
+    const repaintNeeded =
+      !state.progressCaptureTimer;
+
     clearTimeout(
       state.progressCaptureTimer,
     );
@@ -8098,7 +8271,26 @@ function ensureLockButtonPresentation(
         gallery,
       );
 
-    state.progressEntries = [];
+    state.progressCaptureTimer =
+      setTimeout(
+        () => {
+          void finishProgressCapture(
+            token,
+          );
+        },
+        delay,
+      );
+
+    return repaintNeeded;
+  }
+
+  function startProgressCapture(
+    gallery,
+  ) {
+    scheduleProgressCaptureFinish(
+      gallery,
+    );
+
     state.progressLastError = null;
 
     updateTemplateProgressUi(
@@ -8115,16 +8307,73 @@ function ensureLockButtonPresentation(
      * Request one final frame in case Wplace still allows it.
      */
     requestMapRepaint();
+  }
 
-    state.progressCaptureTimer =
-      setTimeout(
-        () => {
-          void finishProgressCapture(
-            token,
+  function ensureProgressThumbnailListeners(
+    gallery,
+  ) {
+    for (
+      const image of
+      gallery.querySelectorAll(
+        `${TEMPLATE_GALLERY_ITEM_SELECTOR} img`,
+      )
+    ) {
+      if (
+        "wpttProgressThumbnailBound" in
+          image.dataset
+      ) {
+        continue;
+      }
+
+      image.dataset
+        .wpttProgressThumbnailBound = "";
+
+      const retry = () => {
+        const row =
+          image.closest(
+            TEMPLATE_GALLERY_ITEM_SELECTOR,
           );
-        },
-        100,
+
+        if (
+          !state.progressModalVisible ||
+          !row?.isConnected ||
+          !getTemplateRowOrderId(
+            row,
+          )
+        ) {
+          return;
+        }
+
+        const repaintNeeded =
+          scheduleProgressCaptureFinish(
+            gallery,
+            50,
+          );
+
+        if (repaintNeeded) {
+          requestMapRepaint();
+        }
+      };
+
+      image.addEventListener(
+        "load",
+        retry,
       );
+
+      image.addEventListener(
+        "error",
+        retry,
+      );
+
+      if (
+        image.complete &&
+        image.getAttribute(
+          "src",
+        )
+      ) {
+        queueMicrotask(retry);
+      }
+    }
   }
 
   function getTemplateActionMenus(
@@ -8490,27 +8739,37 @@ function ensureLockButtonPresentation(
     ];
   }
 
-  function getTemplateRowOrderId(
+  function getLegacyTemplateRowOrderId(
     row,
   ) {
     const cached =
       row.dataset
-        .wpttTemplateOrderId;
+        .wpttTemplateLegacyOrderId ??
+      (
+        row.dataset
+          .wpttTemplateOrderId &&
+        !row.dataset
+          .wpttTemplateOrderId
+          .startsWith(
+            WPLACE_TEMPLATE_ORDER_ID_PREFIX,
+          )
+          ? row.dataset
+              .wpttTemplateOrderId
+          : null
+      );
 
     if (cached) {
+      row.dataset
+        .wpttTemplateLegacyOrderId =
+        cached;
+
       return cached;
     }
 
     const title =
-      row.querySelector(
-        "p[title]",
-      )?.getAttribute(
-        "title",
-      ) ??
-      row.querySelector(
-        "p",
-      )?.textContent?.trim() ??
-      "";
+      getTemplateRowIdentityTitle(
+        row,
+      );
 
     const imageSource =
       row.querySelector(
@@ -8533,11 +8792,278 @@ function ensureLockButtonPresentation(
         identitySource,
       )}:${identitySource.length}`;
 
+    /*
+     * Wplace swaps a loading indicator for the thumbnail after the row is
+     * created. Only cache the fallback once the image identity is present.
+     */
+    if (imageSource) {
+      row.dataset
+        .wpttTemplateLegacyOrderId =
+        orderId;
+    }
+
+    return orderId;
+  }
+
+  function getTemplateRowIdentityTitle(
+    row,
+  ) {
+    return (
+      row.querySelector(
+        "p[title]",
+      )?.getAttribute(
+        "title",
+      ) ??
+      row.querySelector(
+        "p",
+      )?.textContent?.trim() ??
+      ""
+    );
+  }
+
+  function getUnloadedTemplateRowOrderId(
+    row,
+  ) {
+    const cached =
+      row.dataset
+        .wpttTemplateUnloadedOrderId;
+
+    if (cached) {
+      return cached;
+    }
+
+    const identitySource =
+      `${getTemplateRowIdentityTitle(
+        row,
+      )}\n`;
+
+    const orderId =
+      `template:${hashTemplateOrderText(
+        identitySource,
+      )}:${identitySource.length}`;
+
     row.dataset
-      .wpttTemplateOrderId =
+      .wpttTemplateUnloadedOrderId =
       orderId;
 
     return orderId;
+  }
+
+  function loadWplaceTemplateOrderIds(
+    expectedCount,
+  ) {
+    try {
+      const raw =
+        globalThis.localStorage?.getItem(
+          WPLACE_TEMPLATE_STORAGE_KEY,
+        );
+
+      const parsed =
+        JSON.parse(raw ?? "[]");
+
+      if (!Array.isArray(parsed)) {
+        return null;
+      }
+
+      const entries =
+        parsed
+          .filter(
+            (entry) =>
+              entry &&
+              !entry.serverManaged &&
+              typeof entry.id ===
+                "string" &&
+              entry.id.length > 0 &&
+              Number.isFinite(
+                entry.order,
+              ),
+          )
+          .map(
+            (entry, index) => ({
+              id: entry.id,
+              order: entry.order,
+              index,
+            }),
+          );
+
+      /*
+       * Wplace writes template storage shortly after updating the gallery.
+       * Do not associate rows with a stale snapshot while a template is
+       * being added or removed.
+       */
+      if (
+        entries.length !==
+        expectedCount
+      ) {
+        return null;
+      }
+
+      return entries
+        .sort(
+          (first, second) =>
+            first.order -
+              second.order ||
+            first.index -
+              second.index,
+        )
+        .map(
+          (entry) =>
+            entry.id,
+        );
+    } catch {
+      return null;
+    }
+  }
+
+  function getWplaceTemplateRowOrderId(
+    row,
+  ) {
+    const cached =
+      row.dataset
+        .wpttTemplateOrderId;
+
+    if (
+      cached?.startsWith(
+        WPLACE_TEMPLATE_ORDER_ID_PREFIX,
+      )
+    ) {
+      return cached;
+    }
+
+    return null;
+  }
+
+  function cacheWplaceTemplateRowOrderIds(
+    rows,
+  ) {
+    if (
+      rows.every(
+        (row) =>
+          row.dataset
+            .wpttTemplateOrderId
+            ?.startsWith(
+              WPLACE_TEMPLATE_ORDER_ID_PREFIX,
+            ),
+      )
+    ) {
+      return;
+    }
+
+    const ids =
+      loadWplaceTemplateOrderIds(
+        rows.length,
+      );
+
+    if (!ids) {
+      return;
+    }
+
+    for (
+      const row of rows
+    ) {
+      if (
+        getWplaceTemplateRowOrderId(
+          row,
+        )
+      ) {
+        continue;
+      }
+
+      const nativeIndex =
+        getTemplateNativeIndex(
+          row,
+        );
+
+      const id =
+        nativeIndex === null
+          ? null
+          : ids[nativeIndex];
+
+      if (!id) {
+        continue;
+      }
+
+      const previousId =
+        row.dataset
+          .wpttTemplateOrderId;
+
+      if (
+        previousId &&
+        !previousId.startsWith(
+          WPLACE_TEMPLATE_ORDER_ID_PREFIX,
+        ) &&
+        !row.dataset
+          .wpttTemplateLegacyOrderId
+      ) {
+        row.dataset
+          .wpttTemplateLegacyOrderId =
+          previousId;
+      }
+
+      row.dataset
+        .wpttTemplateOrderId =
+        `${WPLACE_TEMPLATE_ORDER_ID_PREFIX}${id}`;
+    }
+  }
+
+  function getTemplateRowOrderId(
+    row,
+  ) {
+    const cached =
+      row.dataset
+        .wpttTemplateProgressOrderId;
+
+    if (cached) {
+      return cached;
+    }
+
+    const image =
+      row.querySelector(
+        "img",
+      );
+
+    const imageSource =
+      image?.getAttribute(
+        "src",
+      ) ??
+      "";
+
+    /*
+     * Do not create a progress identity from a loading row. Its title or
+     * position is not sufficient to distinguish same-sized templates.
+     */
+    if (
+      !imageSource ||
+      !image.complete ||
+      image.naturalWidth < 1 ||
+      image.naturalHeight < 1
+    ) {
+      return null;
+    }
+
+    const orderId =
+      getLegacyTemplateRowOrderId(
+        row,
+      );
+
+    row.dataset
+      .wpttTemplateProgressOrderId =
+      orderId;
+
+    return orderId;
+  }
+
+  function getTemplateRowReorderId(
+    row,
+  ) {
+    return (
+      getWplaceTemplateRowOrderId(
+        row,
+      ) ??
+      getLegacyTemplateRowOrderId(
+        row,
+      )
+    );
   }
 
   function compareTemplateRowsByNativeOrder(
@@ -8618,6 +9144,212 @@ function ensureLockButtonPresentation(
     );
   }
 
+  function migrateSavedTemplateOrderIds(
+    rows,
+  ) {
+    if (
+      !state.templateOrder.some(
+        (id) =>
+          id.startsWith(
+            "template:",
+          ),
+      )
+    ) {
+      return;
+    }
+
+    const nativeRows =
+      [...rows].sort(
+        compareTemplateRowsByNativeOrder,
+      );
+
+    const stableIds =
+      nativeRows.map(
+        getWplaceTemplateRowOrderId,
+      );
+
+    if (
+      stableIds.some(
+        (id) => !id,
+      )
+    ) {
+      return;
+    }
+
+    if (
+      nativeRows.some(
+        (row) =>
+          !row.querySelector(
+            "img",
+          )?.getAttribute(
+            "src",
+          ),
+      )
+    ) {
+      return;
+    }
+
+    const replacements =
+      new Map();
+
+    nativeRows.forEach(
+      (row, index) => {
+        const legacyId =
+          getLegacyTemplateRowOrderId(
+            row,
+          );
+
+        const stableId =
+          stableIds[index];
+
+        if (
+          legacyId === stableId
+        ) {
+          return;
+        }
+
+        const ids =
+          replacements.get(
+            legacyId,
+          ) ?? [];
+
+        ids.push(stableId);
+
+        replacements.set(
+          legacyId,
+          ids,
+        );
+      },
+    );
+
+    const currentStableIds =
+      new Set(stableIds);
+
+    const used = new Map();
+    let changed = false;
+
+    const migrated = [];
+
+    for (
+      const id of
+      state.templateOrder
+    ) {
+      if (
+        currentStableIds.has(id)
+      ) {
+        migrated.push(id);
+
+        continue;
+      }
+
+      if (
+        !id.startsWith(
+          "template:",
+        )
+      ) {
+        migrated.push(id);
+
+        continue;
+      }
+
+      const ids =
+        replacements.get(id);
+
+      const index =
+        used.get(id) ?? 0;
+
+      const replacement =
+        ids?.[index];
+
+      if (replacement) {
+        used.set(
+          id,
+          index + 1,
+        );
+
+        migrated.push(
+          replacement,
+        );
+      }
+
+      changed = true;
+    }
+
+    if (changed) {
+      saveTemplateOrder(
+        migrated,
+      );
+    }
+  }
+
+  function mergeTemplateOrder(
+    savedOrder,
+    nativeOrder,
+  ) {
+    const remaining =
+      new Map();
+
+    for (
+      const id of nativeOrder
+    ) {
+      remaining.set(
+        id,
+        (remaining.get(id) ?? 0) +
+          1,
+      );
+    }
+
+    const saved = [];
+
+    for (
+      const id of savedOrder
+    ) {
+      const count =
+        remaining.get(id) ?? 0;
+
+      if (count < 1) {
+        continue;
+      }
+
+      saved.push(id);
+
+      remaining.set(
+        id,
+        count - 1,
+      );
+    }
+
+    const missing = [];
+
+    for (
+      const id of nativeOrder
+    ) {
+      const count =
+        remaining.get(id) ?? 0;
+
+      if (count < 1) {
+        continue;
+      }
+
+      missing.push(id);
+
+      remaining.set(
+        id,
+        count - 1,
+      );
+    }
+
+    /*
+     * Wplace assigns newly added templates native order zero. Keep those
+     * unsaved entries at the top instead of appending them after a custom
+     * order.
+     */
+    return [
+      ...missing,
+      ...saved,
+    ];
+  }
+
   function getCompleteTemplateOrder(
     gallery,
   ) {
@@ -8626,42 +9358,27 @@ function ensureLockButtonPresentation(
         gallery,
       );
 
-    const currentIds =
-      rows.map(
-        getTemplateRowOrderId,
-      );
+    cacheWplaceTemplateRowOrderIds(
+      rows,
+    );
 
-    const currentSet =
-      new Set(
-        currentIds,
-      );
+    migrateSavedTemplateOrderIds(
+      rows,
+    );
 
-    const saved =
-      state.templateOrder.filter(
-        (id) =>
-          currentSet.has(id),
-      );
-
-    const savedSet =
-      new Set(saved);
-
-    const missing =
+    const nativeIds =
       [...rows]
         .sort(
           compareTemplateRowsByNativeOrder,
         )
         .map(
-          getTemplateRowOrderId,
-        )
-        .filter(
-          (id) =>
-            !savedSet.has(id),
+          getTemplateRowReorderId,
         );
 
-    return [
-      ...saved,
-      ...missing,
-    ];
+    return mergeTemplateOrder(
+      state.templateOrder,
+      nativeIds,
+    );
   }
 
   function applySavedTemplateOrder(
@@ -8681,25 +9398,37 @@ function ensureLockButtonPresentation(
         gallery,
       );
 
-    const positions =
-      new Map(
-        order.map(
-          (id, index) => [
-            id,
-            index,
-          ],
-        ),
-      );
+    const positions = new Map();
+
+    order.forEach(
+      (id, index) => {
+        const queue =
+          positions.get(id) ?? [];
+
+        queue.push(index);
+
+        positions.set(
+          id,
+          queue,
+        );
+      },
+    );
 
     for (
-      const row of rows
+      const row of
+      [...rows].sort(
+        compareTemplateRowsByNativeOrder,
+      )
     ) {
-      const nextOrder =
+      const queue =
         positions.get(
-          getTemplateRowOrderId(
+          getTemplateRowReorderId(
             row,
           ),
         );
+
+      const nextOrder =
+        queue?.shift();
 
       if (
         !Number.isInteger(
@@ -8729,7 +9458,7 @@ function ensureLockButtonPresentation(
       getTemplateRowsInDisplayOrder(
         gallery,
       ).map(
-        getTemplateRowOrderId,
+        getTemplateRowReorderId,
       );
 
     saveTemplateOrder(
@@ -8743,7 +9472,7 @@ function ensureLockButtonPresentation(
   ) {
     const ids =
       rows.map(
-        getTemplateRowOrderId,
+        getTemplateRowReorderId,
       );
 
     saveTemplateOrder(
@@ -9335,6 +10064,10 @@ function ensureLockButtonPresentation(
       gallery,
     );
 
+    ensureProgressThumbnailListeners(
+      gallery,
+    );
+
     ensureReorderModeButton(
       dialog,
     );
@@ -9473,7 +10206,7 @@ function ensureLockButtonPresentation(
       }
 
       return {
-        version: "1.3.0",
+        version: "1.3.1",
 
         highlight:
           state.highlightMode ===
